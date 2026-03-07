@@ -7,20 +7,7 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'cmake/**'
-      - 'src/**'
-      - 'include/**'
-      - 'proto/**'
-      - 'third_party/**'
-      - 'tools/python_bind/**'
-      - 'tools/shell/**'
-      - '.github/workflows/build-wheel.yml'
-      - 'CMakeLists.txt'
-  pull_request:
-    branches:
-      - main
-    paths:
+    paths: &wheel_paths
       - 'cmake/**'
       - 'src/**'
       - 'include/**'
@@ -31,6 +18,10 @@ on:
       - '.github/workflows/build-wheel.yml'
       - 'scripts/install_deps.sh'
       - 'CMakeLists.txt'
+  pull_request:
+    branches:
+      - main
+    paths: *wheel_paths
 
 concurrency:
   group: ${{ github.repository }}-${{ github.event.number || github.head_ref || github.sha }}-${{ github.workflow }}
@@ -38,7 +29,7 @@ concurrency:
 
 jobs:
   build_wheels_linux_x86_64:
-    runs-on: [ubuntu-22.04, linux, x64]
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: checkout
         id: checkout
@@ -91,7 +82,7 @@ jobs:
         run: |
           python3 -m pip freeze | xargs python3 -m pip uninstall -y || true
     
-      - name: Run simple test
+      - name: Run simple and complex tests
         env:
           TMP_DIR: ${{ github.workspace }}/${{ github.run_id }}
         run: |
@@ -102,6 +93,7 @@ jobs:
           done
           rm -rf ${TMP_DIR}/test_example
           GLOG_v=10 python3 tools/python_bind/example/simple_example.py example_dataset/modern_graph ${TMP_DIR}/test_example
+          python3 tools/python_bind/example/complex_test.py
 
       - name: Run NeuG-Cli test
         run: |
@@ -109,7 +101,7 @@ jobs:
           neug-cli --version
 
   build_wheels_linux_arm64:
-    runs-on: [ubuntu-22.04, linux, arm64]
+    runs-on: [self-hosted, linux, arm64]
     if: true
     steps:
       - name: checkout
@@ -119,7 +111,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Python 3.13
-        if: runner.name != 'iZj6ceai23dyzfm63tvmu7Z'
+        if: runner.name != 'arm64-1'
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -164,7 +156,7 @@ jobs:
         run: |
           python3 -m pip freeze | xargs python3 -m pip uninstall -y || true
     
-      - name: Run simple test
+      - name: Run simple and complex tests
         env:
           TMP_DIR: ${{ github.workspace }}/${{ github.run_id }}
         run: |
@@ -175,6 +167,7 @@ jobs:
           done
           rm -rf ${TMP_DIR}/test_example
           GLOG_v=10 python3 tools/python_bind/example/simple_example.py example_dataset/modern_graph ${TMP_DIR}/test_example
+          python3 tools/python_bind/example/complex_test.py
 
       - name: Run NeuG-Cli test
         run: |
@@ -342,86 +335,6 @@ jobs:
         run: |
           neug-cli --help
           neug-cli --version
-
-  test_wheels_linux_x86_64:
-    needs: build_wheels_linux_x86_64
-    if: needs.build_wheels_linux_x86_64.result == 'success'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.13']
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: wheels-linux-x86_64-${{ github.run_id }}
-          path: wheelhouse
-
-      - name: Install wheel and run complex test
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip uninstall -y neug || true
-          PY_VERSION="${{ matrix.python-version }}"
-          PY_TAG="cp$(echo "$PY_VERSION" | tr -d '.')"
-          TARGET=$(ls wheelhouse/*${PY_TAG}*.whl | head -n 1 || true)
-          if [ -z "$TARGET" ]; then
-            echo "No wheel found for tag ${PY_TAG}"
-            ls -R wheelhouse
-            exit 1
-          fi
-          echo "Installing $TARGET"
-          python -m pip install "$TARGET"
-          python tools/python_bind/example/complex_test.py
-
-  test_wheels_linux_arm64:
-    needs: build_wheels_linux_arm64
-    if: needs.build_wheels_linux_arm64.result == 'success'
-    runs-on: ubuntu-22.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.13']
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: wheels-linux-arm64-${{ github.run_id }}
-          path: wheelhouse
-
-      - name: Install wheel and run complex test
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip uninstall -y neug || true
-          PY_VERSION="${{ matrix.python-version }}"
-          PY_TAG="cp$(echo "$PY_VERSION" | tr -d '.')"
-          TARGET=$(ls wheelhouse/*${PY_TAG}*.whl | head -n 1 || true)
-          if [ -z "$TARGET" ]; then
-            echo "No wheel found for tag ${PY_TAG}"
-            ls -R wheelhouse
-            exit 1
-          fi
-          echo "Installing $TARGET"
-          python -m pip install "$TARGET"
-          python tools/python_bind/example/complex_test.py
 
   test_wheels_macos_x86_64:
     needs: build_wheels_macos_x86_64
