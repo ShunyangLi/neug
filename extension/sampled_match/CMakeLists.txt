@@ -20,7 +20,7 @@ set(SAMPLED_MATCH_EXTENSION_OBJECT_FILES
 build_extension_lib("sampled_match")
 
 if (${BUILD_TEST})
-    add_subdirectory(test)
+    add_subdirectory(tests)
 endif ()
 
 # Set include directories

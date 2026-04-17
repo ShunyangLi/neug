@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * 	http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -40,7 +40,7 @@
 #include "neug/storages/graph/graph_interface.h"
 #include "neug/storages/graph/property_graph.h"
 
-#include "data_graph_meta.h"
+#include "sampled_match_data_graph_meta.h"
 #include "FaSTest/src/SubgraphMatching/PatternGraph.h"
 #include "FaSTest/src/SubgraphCounting/CardinalityEstimation.h"
 
@@ -188,10 +188,9 @@ inline std::vector<PropCons> ParseConstraints(const rapidjson::Value& constraint
 }
 
 // ============================================================================
-// 辅助函数：生成唯一的输出文件路径
+// Output file path helper: builds a unique path under /tmp/p/neug_sample.
 // ============================================================================
 inline std::string GenerateOutputFilePath(const std::string& prefix) {
-  // 使用时间戳 + 随机数生成唯一文件名
   auto now = std::chrono::system_clock::now();
   auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
       now.time_since_epoch()).count();
@@ -200,28 +199,27 @@ inline std::string GenerateOutputFilePath(const std::string& prefix) {
 }
 
 // ============================================================================
-// GraphDataCache: 缓存图数据的预处理结果，避免重复计算
+// GraphDataCache: caches preprocessed graph metadata so repeated SAMPLED_MATCH
+// calls on the same graph avoid rebuilding DataGraphMeta every time.
 // ============================================================================
 
 class GraphDataCache {
  public:
-  // 获取单例实例
   static GraphDataCache& Instance() {
     static GraphDataCache instance;
     return instance;
   }
 
-  // 缓存数据结构
   struct CachedData {
     std::unique_ptr<DataGraphMeta> data_meta;
     std::shared_ptr<std::unordered_map<label_t, std::unordered_map<label_t, std::vector<label_t>>>> schema_graph;
     bool preprocessed = false;
   };
 
-  // 获取或创建缓存数据
+  // Returns the cache slot for `graph_ptr`, creating it lazily on first use.
   CachedData& GetOrCreate(const StorageReadInterface* graph_ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     auto it = cache_.find(graph_ptr);
     if (it == cache_.end()) {
       auto& data = cache_[graph_ptr];
@@ -232,20 +230,17 @@ class GraphDataCache {
     return cache_[graph_ptr];
   }
 
-  // 检查是否已有缓存
   bool HasCache(const StorageReadInterface* graph_ptr) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cache_.find(graph_ptr);
     return it != cache_.end() && it->second.preprocessed;
   }
 
-  // 清除特定图的缓存
   void ClearCache(const StorageReadInterface* graph_ptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     cache_.erase(graph_ptr);
   }
 
-  // 清除所有缓存
   void ClearAll() {
     std::lock_guard<std::mutex> lock(mutex_);
     cache_.clear();
@@ -382,15 +377,18 @@ inline bool LoadGraphCheckpoint(const StorageReadInterface& graph, const std::st
 }
 
 // ============================================================================
-// 辅助函数：执行图初始化（构建 label mappings 和预处理）
+// Graph initialization: builds label mappings and runs DataGraphMeta
+// preprocessing. Shared by the INITIALIZE CALL function and by match() on
+// first use, so either path ends up with the same cached state.
 // ============================================================================
 
 /**
- * @brief 执行图的初始化操作（提取出来供 Initialize 函数和 match() 复用）
- * @param graph 图存储接口
- * @param verbose 是否输出详细日志
- * @param checkpoint_dir 可选的checkpoint目录，非空时优先从文件加载
- * @return 初始化是否成功
+ * @brief Build the per-graph caches that SAMPLED_MATCH relies on.
+ * @param graph           Graph storage to preprocess.
+ * @param verbose         Emit progress logs when true.
+ * @param checkpoint_dir  If non-empty, try loading the cache from this
+ *                        directory before falling back to full preprocessing.
+ * @return true on success.
  */
 inline bool DoGraphInitialization(const StorageReadInterface& graph, bool verbose = true,
                                   const std::string& checkpoint_dir = "") {
@@ -419,7 +417,6 @@ inline bool DoGraphInitialization(const StorageReadInterface& graph, bool verbos
     }
   }
   
-  // 构建 label mappings
   if (verbose) {
     std::cout << "[0] Building label mappings..." << std::endl;
   }
@@ -445,7 +442,6 @@ inline bool DoGraphInitialization(const StorageReadInterface& graph, bool verbos
     std::cout << "[1] Preprocessing data graph..." << std::endl;
   }
   
-  // 预处理数据图
   cached_data.data_meta->Preprocess();
   cached_data.preprocessed = true;
   
@@ -478,24 +474,21 @@ class SampledSubgraphMatcher {
    * @return Estimated count of embeddings
    */
   double match() {
-    // 获取或创建缓存数据
     auto& cache = GraphDataCache::Instance();
     auto& cached_data = cache.GetOrCreate(&graph_);
-    
-    // Step 0 & 1: 使用缓存避免重复计算，如果未初始化则自动调用 DoGraphInitialization
+
+    // Steps 0-1: reuse the cache when possible; initialize lazily otherwise.
     if (!cached_data.preprocessed) {
-      // 首次调用：自动执行图初始化
       std::cout << "[match] Graph not initialized, calling DoGraphInitialization..." << std::endl;
       DoGraphInitialization(graph_, true);
     } else {
-      // 后续调用：使用缓存
       std::cout << "[0-1] Using cached graph data..." << std::endl;
       std::cout << "  Vertices: " << cached_data.data_meta->GetNumVertices() << std::endl;
       std::cout << "  Edges: " << cached_data.data_meta->GetNumEdges() << std::endl;
     }
     std::cout << std::endl;
 
-    // Step 2: Load pattern from JSON file (每次调用都需要，因为 pattern 可能不同)
+    // Step 2: always reload the pattern — callers can vary it per invocation.
     std::cout << "[2] Loading pattern graph from: " << pattern_file_ << std::endl;
     pattern_graph_ = CreatePatternFromJson(pattern_file_);
     if (!pattern_graph_ || pattern_graph_->GetNumVertices() == 0) {
@@ -1257,7 +1250,8 @@ class SampledSubgraphMatcher {
 };
 
 // ============================================================================
-// InitializeGraphFunction: 初始化图数据（可通过 CALL Initialize() 调用）
+// InitializeGraphFunction: CALL INITIALIZE([checkpoint_dir]) — populates the
+// GraphDataCache, optionally restoring from a previously saved checkpoint.
 // ============================================================================
 
 struct InitializeGraphInput : public CallFuncInputBase {
@@ -1414,7 +1408,8 @@ struct InitializeGraphFunction {
 };
 
 // ============================================================================
-// SaveCheckpointFunction: 保存图缓存数据到checkpoint文件
+// SaveSampledmatchCheckpointFunction: persists the GraphDataCache contents so
+// a later INITIALIZE call can skip preprocessing.
 // CALL SAVE_SAMPLEDMATCH_CHECKPOINT('/path/to/checkpoint') RETURN *;
 // ============================================================================
 
@@ -1488,10 +1483,10 @@ struct SaveSampledmatchCheckpointFunction {
 };
 
 // ============================================================================
-// NeugCallFunction 实现：子图匹配函数
+// SampledMatchFunction: CALL SAMPLED_MATCH(pattern_file, sample_size) — the
+// main entry point that runs subgraph sampling against the cached graph.
 // ============================================================================
 
-// 函数输入数据结构
 struct SampledMatchInput : public CallFuncInputBase {
   std::string patternFilePath;
   long long sampleSize;
@@ -1499,32 +1494,29 @@ struct SampledMatchInput : public CallFuncInputBase {
   ~SampledMatchInput() override = default;
 };
 
-// 主函数结构
 struct SampledMatchFunction {
   static constexpr const char* name = "SAMPLED_MATCH";
-  
+
   static function_set getFunctionSet() {
     function_set functionSet;
-    
-    // 输出列定义：4 列
-    //   col 0: estimated_count (double) - 估计的嵌入总数
-    //   col 1: sample_count (int64) - 采样数量
-    //   col 2: result_file (string) - CSV 结果文件路径
-    //   col 3: props_file (string) - JSON 属性文件路径 (empty if no props needed)
+
+    // Four-column result layout:
+    //   col 0: estimated_count (double) — estimated total number of embeddings
+    //   col 1: sample_count    (int64)  — number of sampled embeddings returned
+    //   col 2: result_file     (string) — CSV path holding the samples
+    //   col 3: props_file      (string) — JSON path of extra properties, or empty
     call_output_columns outputCols{
         {"estimated_count", common::LogicalTypeID::DOUBLE},
         {"sample_count", common::LogicalTypeID::INT64},
         {"result_file", common::LogicalTypeID::STRING},
         {"props_file", common::LogicalTypeID::STRING}
     };
-    
-    // 创建 NeugCallFunction
+
     auto func = std::make_unique<NeugCallFunction>(
         name,
         std::vector<common::LogicalTypeID>{common::LogicalTypeID::STRING, common::LogicalTypeID::INT64},
         std::move(outputCols));
-    
-    // 设置 bindFunc
+
     func->bindFunc = [](const Schema& schema, const execution::ContextMeta& ctx_meta,
                         const ::physical::PhysicalPlan& plan, int op_idx) 
         -> std::unique_ptr<CallFuncInputBase> {
@@ -1574,7 +1566,6 @@ struct SampledMatchFunction {
       
       LOG(INFO) << "[SAMPLED_MATCH] Starting subgraph matching...";
       
-      // 执行子图匹配
       SampledSubgraphMatcher matcher(*readInterface, matchInput.patternFilePath, matchInput.sampleSize);
       double estimatedCount = matcher.match();
       
@@ -1589,19 +1580,16 @@ struct SampledMatchFunction {
       LOG(INFO) << "[SAMPLED_MATCH] Sampled embeddings: " << sampleCount;
       LOG(INFO) << "[SAMPLED_MATCH] Pattern edges: " << patternEdgeCount;
       
-      // 生成输出 CSV 文件路径
       std::string outputFile = GenerateOutputFilePath("sampled_match");
-      
-      // 写入 CSV 文件
+
       std::ofstream ofs(outputFile);
       if (!ofs.is_open()) {
         LOG(ERROR) << "[SAMPLED_MATCH] Failed to open output file: " << outputFile;
         return execution::Context();
       }
-      
-      // 写入 CSV 表头
-      // 顶点列: v0, v1, v2, ...
-      // 边列: v0-v1, v0-v2, ... (格式: src_global:dst_global:edge_label)
+
+      // CSV header: vertex columns (v0, v1, ...) followed by edge columns
+      // (vSRC-vDST) encoded as src_global:dst_global:edge_label.
       for (int v = 0; v < patternVertexCount; v++) {
         if (v > 0) ofs << ",";
         ofs << "v" << v;
@@ -1611,15 +1599,12 @@ struct SampledMatchFunction {
         ofs << ",v" << src << "-v" << dst;
       }
       ofs << "\n";
-      
-      // 写入每个采样结果
+
       for (int s = 0; s < sampleCount; s++) {
-        // 写入顶点 ID
         for (int v = 0; v < patternVertexCount; v++) {
           if (v > 0) ofs << ",";
           ofs << sampledResults[s * patternVertexCount + v];
         }
-        // 写入边 key
         for (int e = 0; e < patternEdgeCount; e++) {
           ofs << "," << matcher.GetSampledEdgeKey(s, e);
         }
@@ -1637,30 +1622,25 @@ struct SampledMatchFunction {
           LOG(INFO) << "[SAMPLED_MATCH] No properties requested or no results";
       }
       
-      // 创建返回结果 Context (1 行，4 列)
+      // Assemble the 1-row, 4-column result Context.
       execution::Context ctx;
-      
-      // col 0: estimated_count
+
       execution::ValueColumnBuilder<double> estimatedCountBuilder;
       estimatedCountBuilder.push_back_opt(estimatedCount);
       ctx.set(0, estimatedCountBuilder.finish());
-      
-      // col 1: sample_count
+
       execution::ValueColumnBuilder<int64_t> sampleCountBuilder;
       sampleCountBuilder.push_back_opt(static_cast<int64_t>(sampleCount));
       ctx.set(1, sampleCountBuilder.finish());
-      
-      // col 2: result_file
+
       execution::ValueColumnBuilder<std::string> filePathBuilder;
       filePathBuilder.push_back_opt(std::string(outputFile));
       ctx.set(2, filePathBuilder.finish());
-      
-      // col 3: props_file
+
       execution::ValueColumnBuilder<std::string> propsFileBuilder;
       propsFileBuilder.push_back_opt(std::string(propsFile));
       ctx.set(3, propsFileBuilder.finish());
-      
-      // 设置 tag_ids
+
       ctx.tag_ids = {0, 1, 2, 3};
       
       LOG(INFO) << "[SAMPLED_MATCH] Returned 1 row with result file: " << outputFile 
@@ -1675,9 +1655,10 @@ struct SampledMatchFunction {
 };
 
 // ============================================================================
-// GetVertexProperty: 获取顶点属性
-// 输入: vertex_ids (JSON array string), vertex_label (STRING), property_names (JSON array string)
-// 输出: 结果写入 CSV 文件，返回文件路径
+// GetVertexPropertyFunction: looks up vertex properties and writes a CSV.
+//   Inputs : vertex_ids (JSON array), vertex_label (string),
+//            property_names (JSON array).
+//   Output : path of the generated CSV file.
 // ============================================================================
 
 struct GetVertexPropertyInput : public CallFuncInputBase {
@@ -1696,11 +1677,11 @@ struct GetVertexPropertyFunction {
   static function_set getFunctionSet() {
     function_set functionSet;
     
-    // 输出列：只有 1 列 - CSV 文件路径
+    // Output schema: single string column carrying the generated file path.
     call_output_columns outputCols{
         {"result_file", common::LogicalTypeID::STRING}
     };
-    
+
     auto func = std::make_unique<NeugCallFunction>(
         name,
         std::vector<common::LogicalTypeID>{
@@ -1709,18 +1690,18 @@ struct GetVertexPropertyFunction {
             common::LogicalTypeID::STRING   // property_names as JSON array string
         },
         std::move(outputCols));
-    
+
     func->bindFunc = [](const Schema& schema, const execution::ContextMeta& ctx_meta,
-                        const ::physical::PhysicalPlan& plan, int op_idx) 
+                        const ::physical::PhysicalPlan& plan, int op_idx)
         -> std::unique_ptr<CallFuncInputBase> {
       auto& procedure = plan.plan(op_idx).opr().procedure_call();
-      
+
       std::vector<int64_t> vertex_ids;
       std::string vertex_label;
       std::vector<std::string> property_names;
-      
+
       if (procedure.query().arguments_size() >= 3) {
-        // 参数 0: vertex_ids (JSON array)
+        // Arg 0: vertex_ids — JSON array of ints.
         if (procedure.query().arguments(0).has_const_()) {
           std::string ids_str = procedure.query().arguments(0).const_().str();
           rapidjson::Document doc;
@@ -1731,13 +1712,13 @@ struct GetVertexPropertyFunction {
             }
           }
         }
-        
-        // 参数 1: vertex_label
+
+        // Arg 1: vertex_label name.
         if (procedure.query().arguments(1).has_const_()) {
           vertex_label = procedure.query().arguments(1).const_().str();
         }
-        
-        // 参数 2: property_names (JSON array)
+
+        // Arg 2: property_names — JSON array of strings.
         if (procedure.query().arguments(2).has_const_()) {
           std::string props_str = procedure.query().arguments(2).const_().str();
           rapidjson::Document doc;
@@ -1766,28 +1747,27 @@ struct GetVertexPropertyFunction {
         return execution::Context();
       }
       
-      // 获取缓存数据
       auto& cache = GraphDataCache::Instance();
       auto& cached_data = cache.GetOrCreate(readInterface);
       if (!cached_data.preprocessed) {
         LOG(WARNING) << "[GET_VERTEX_PROPERTY] Cache not preprocessed, calling DoGraphInitialization...";
-        DoGraphInitialization(*readInterface, false);  // silent mode
+        DoGraphInitialization(*readInterface, false);
       }
-      
+
       const auto& schema = readInterface->schema();
       if (!schema.contains_vertex_label(propInput.vertex_label)) {
         LOG(ERROR) << "[GET_VERTEX_PROPERTY] vertex label '" << propInput.vertex_label << "' not found in schema";
         return execution::Context();
       }
       label_t vertex_label_id = schema.get_vertex_label_id(propInput.vertex_label);
-      
+
       int numVertices = propInput.vertex_ids.size();
       int numProps = propInput.property_names.size();
-      
-      // 生成输出 CSV 文件路径
+
       std::string outputFile = GenerateOutputFilePath("vertex_property");
-      
-      // 获取属性索引
+
+      // Resolve user-facing property names into storage indices; -1 marks
+      // properties the schema does not define (written as empty cells).
       std::vector<std::string> all_prop_names = schema.get_vertex_property_names(vertex_label_id);
       std::vector<int> prop_indices;
       for (const auto& pname : propInput.property_names) {
@@ -1798,37 +1778,35 @@ struct GetVertexPropertyFunction {
           prop_indices.push_back(-1);
         }
       }
-      
-      // 写入 CSV 文件
+
       std::ofstream ofs(outputFile);
       if (!ofs.is_open()) {
         LOG(ERROR) << "[GET_VERTEX_PROPERTY] Failed to open output file: " << outputFile;
         return execution::Context();
       }
-      
-      // 写入表头: vertex_id, prop1, prop2, ...
+
+      // Header row: vertex_id, prop1, prop2, ...
       ofs << "vertex_id";
       for (const auto& pname : propInput.property_names) {
         ofs << "," << pname;
       }
       ofs << "\n";
-      
-      // 写入每个顶点的数据
+
       for (int64_t global_id : propInput.vertex_ids) {
         ofs << global_id;
-        
+
         auto [label, local_vid] = cached_data.data_meta->ToLocalId(global_id);
-        
+
         for (int p = 0; p < numProps; p++) {
           ofs << ",";
           if (label == vertex_label_id && prop_indices[p] >= 0) {
             try {
               Property prop = readInterface->GetVertexProperty(label, local_vid, prop_indices[p]);
               execution::Value val = execution::property_to_value(prop);
-              // 转义 CSV 中的逗号和引号
+              // Quote and escape per RFC 4180 when the value contains a
+              // comma or a quote; otherwise emit verbatim.
               std::string val_str = val.to_string();
               if (val_str.find(',') != std::string::npos || val_str.find('"') != std::string::npos) {
-                // 需要用引号包围并转义内部引号
                 std::string escaped;
                 for (char c : val_str) {
                   if (c == '"') escaped += "\"\"";
@@ -1839,17 +1817,16 @@ struct GetVertexPropertyFunction {
                 ofs << val_str;
               }
             } catch (...) {
-              // 属性获取失败，留空
+              // Leave cell empty on fetch failure.
             }
           }
         }
         ofs << "\n";
       }
-      
+
       ofs.close();
       LOG(INFO) << "[GET_VERTEX_PROPERTY] Results written to: " << outputFile;
-      
-      // 创建返回结果 Context (1 行，1 列：文件路径)
+
       execution::Context ctx;
       
       execution::ValueColumnBuilder<std::string> filePathBuilder;
@@ -1870,10 +1847,11 @@ struct GetVertexPropertyFunction {
 };
 
 // ============================================================================
-// GetEdgeProperty: 获取边属性
-// 输入: edge_keys (JSON array string), edge_label (STRING), property_names (JSON array string)
-//       edge_key 格式: "src_global:dst_global:edge_label_id"
-// 输出: 结果写入 CSV 文件，返回文件路径
+// GetEdgePropertyFunction: looks up edge properties and writes a CSV.
+//   Inputs : edge_keys (JSON array), edge_label (string),
+//            property_names (JSON array).
+//   edge_key format: "src_global:dst_global:edge_label_id".
+//   Output : path of the generated CSV file.
 // ============================================================================
 
 struct GetEdgePropertyInput : public CallFuncInputBase {
@@ -1892,11 +1870,11 @@ struct GetEdgePropertyFunction {
   static function_set getFunctionSet() {
     function_set functionSet;
     
-    // 输出列：只有 1 列 - CSV 文件路径
+    // Output schema: single string column carrying the generated file path.
     call_output_columns outputCols{
         {"result_file", common::LogicalTypeID::STRING}
     };
-    
+
     auto func = std::make_unique<NeugCallFunction>(
         name,
         std::vector<common::LogicalTypeID>{
@@ -1905,18 +1883,18 @@ struct GetEdgePropertyFunction {
             common::LogicalTypeID::STRING   // property_names as JSON array string
         },
         std::move(outputCols));
-    
+
     func->bindFunc = [](const Schema& schema, const execution::ContextMeta& ctx_meta,
-                        const ::physical::PhysicalPlan& plan, int op_idx) 
+                        const ::physical::PhysicalPlan& plan, int op_idx)
         -> std::unique_ptr<CallFuncInputBase> {
       auto& procedure = plan.plan(op_idx).opr().procedure_call();
-      
+
       std::vector<std::string> edge_keys;
       std::string edge_label;
       std::vector<std::string> property_names;
-      
+
       if (procedure.query().arguments_size() >= 3) {
-        // 参数 0: edge_keys (JSON array)
+        // Arg 0: edge_keys — JSON array of "src:dst:label" strings.
         if (procedure.query().arguments(0).has_const_()) {
           std::string keys_str = procedure.query().arguments(0).const_().str();
           rapidjson::Document doc;
@@ -1926,13 +1904,13 @@ struct GetEdgePropertyFunction {
             }
           }
         }
-        
-        // 参数 1: edge_label
+
+        // Arg 1: edge_label name.
         if (procedure.query().arguments(1).has_const_()) {
           edge_label = procedure.query().arguments(1).const_().str();
         }
-        
-        // 参数 2: property_names (JSON array)
+
+        // Arg 2: property_names — JSON array of strings.
         if (procedure.query().arguments(2).has_const_()) {
           std::string props_str = procedure.query().arguments(2).const_().str();
           rapidjson::Document doc;
@@ -1961,23 +1939,22 @@ struct GetEdgePropertyFunction {
         return execution::Context();
       }
       
-      // 获取缓存数据
       auto& cache = GraphDataCache::Instance();
       auto& cached_data = cache.GetOrCreate(readInterface);
       if (!cached_data.preprocessed) {
         LOG(WARNING) << "[GET_EDGE_PROPERTY] Cache not preprocessed, calling DoGraphInitialization...";
-        DoGraphInitialization(*readInterface, false);  // silent mode
+        DoGraphInitialization(*readInterface, false);
       }
-      
+
       const auto& schema = readInterface->schema();
-      
+
       int numEdges = propInput.edge_keys.size();
       int numProps = propInput.property_names.size();
-      
-      // 生成输出 CSV 文件路径
+
       std::string outputFile = GenerateOutputFilePath("edge_property");
-      
-      // 解析边 keys
+
+      // Split each "src:dst:label" key into its components and resolve the
+      // (label, vid) pair for both endpoints via the graph cache.
       struct ParsedEdge {
         std::string key;
         int64_t src_global;
@@ -2019,7 +1996,8 @@ struct GetEdgePropertyFunction {
         parsed_edges.push_back(pe);
       }
       
-      // 获取边属性索引
+      // Resolve property names to schema indices using the first valid edge
+      // as a reference — edges in one call share the same endpoint labels.
       std::vector<int> prop_indices;
       bool has_valid_edge = false;
       label_t sample_src_label = 0, sample_dst_label = 0, sample_edge_label = 0;
@@ -2048,24 +2026,22 @@ struct GetEdgePropertyFunction {
         }
       }
       
-      // 写入 CSV 文件
       std::ofstream ofs(outputFile);
       if (!ofs.is_open()) {
         LOG(ERROR) << "[GET_EDGE_PROPERTY] Failed to open output file: " << outputFile;
         return execution::Context();
       }
-      
-      // 写入表头: edge_key, src_id, dst_id, prop1, prop2, ...
+
+      // Header row: edge_key, src_id, dst_id, prop1, prop2, ...
       ofs << "edge_key,src_id,dst_id";
       for (const auto& pname : propInput.property_names) {
         ofs << "," << pname;
       }
       ofs << "\n";
-      
-      // 写入每条边的数据
+
       for (const auto& pe : parsed_edges) {
         ofs << pe.key << "," << pe.src_global << "," << pe.dst_global;
-        
+
         for (int p = 0; p < numProps; p++) {
           ofs << ",";
           if (pe.valid && has_valid_edge && p < (int)prop_indices.size() && prop_indices[p] >= 0) {
@@ -2074,14 +2050,15 @@ struct GetEdgePropertyFunction {
                   pe.src_label, pe.dst_label, pe.edge_label_id, prop_indices[p]);
               GenericView view = readInterface->GetGenericOutgoingGraphView(
                   pe.src_label, pe.dst_label, pe.edge_label_id);
-              
-              for (auto it = view.get_edges(pe.src_vid).begin(); 
+
+              // Locate the requested dst vertex among the src's out-edges.
+              for (auto it = view.get_edges(pe.src_vid).begin();
                    it != view.get_edges(pe.src_vid).end(); ++it) {
                 if (*it == pe.dst_vid) {
                   Property prop = accessor.get_data(it);
                   execution::Value val = execution::property_to_value(prop);
                   std::string val_str = val.to_string();
-                  // 转义 CSV
+                  // Quote and escape per RFC 4180 when needed.
                   if (val_str.find(',') != std::string::npos || val_str.find('"') != std::string::npos) {
                     std::string escaped;
                     for (char c : val_str) {
@@ -2096,17 +2073,16 @@ struct GetEdgePropertyFunction {
                 }
               }
             } catch (...) {
-              // 属性获取失败，留空
+              // Leave cell empty on fetch failure.
             }
           }
         }
         ofs << "\n";
       }
-      
+
       ofs.close();
       LOG(INFO) << "[GET_EDGE_PROPERTY] Results written to: " << outputFile;
-      
-      // 创建返回结果 Context (1 行，1 列：文件路径)
+
       execution::Context ctx;
       
       execution::ValueColumnBuilder<std::string> filePathBuilder;
