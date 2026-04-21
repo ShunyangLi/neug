@@ -15,6 +15,14 @@
  * file docs/README.md.                                                     *
 \****************************************************************************/
 
+
+ /**
+ * This file is originally from the json project
+ * (https://github.com/nlohmann/json) Licensed under the MIT License. Modified by
+ * Yunkai Lou and Shunyang Li in 2025 to support Neug-specific features.
+ */
+
+
 #ifndef INCLUDE_NLOHMANN_JSON_HPP_
 #define INCLUDE_NLOHMANN_JSON_HPP_
 
