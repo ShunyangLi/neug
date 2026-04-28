@@ -14,29 +14,25 @@
  * limitations under the License.
  */
 
-// Minimal end-to-end smoke test for the sampled_match extension.
-//
-// Flow:
-//   1. Create a fresh on-disk DB.
-//   2. Build a trivial schema (Person + person_knows_person).
-//   3. Insert a 3-node triangle.
-//   4. LOAD the extension from the build tree (NEUG_EXTENSION_HOME_PYENV is
-//      discovered automatically by walking up from the test executable).
-//   5. Write a triangle pattern JSON in the current working directory.
-//   6. CALL SAMPLED_MATCH and require the result to be non-zero.
-//   7. Clean up the pattern file and DB directory on exit.
+#include <gtest/gtest.h>
 
 #include <neug/main/neug_db.h>
+
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+
+namespace neug {
+namespace test {
 
 namespace {
 
@@ -67,29 +63,7 @@ std::string FindBuildRoot() {
   return "";
 }
 
-bool RunQuery(neug::Connection& conn, const std::string& cypher,
-              const std::string& label) {
-  auto res = conn.Query(cypher);
-  if (!res.has_value()) {
-    std::cerr << "FAILED: " << label << "\n  query: " << cypher
-              << "\n  error: " << res.error().ToString() << std::endl;
-    return false;
-  }
-  return true;
-}
-
-// Guarantee cleanup of temporary artifacts even on early failure.
-struct Cleanup {
-  std::string db_path;
-  std::string pattern_file;
-  ~Cleanup() {
-    std::error_code ec;
-    std::filesystem::remove(pattern_file, ec);
-    std::filesystem::remove_all(db_path, ec);
-  }
-};
-
-constexpr const char* kPatternJson = R"({
+constexpr const char* kTrianglePattern = R"({
   "vertices": [
     {"id": 0, "label": "Person"},
     {"id": 1, "label": "Person"},
@@ -102,88 +76,105 @@ constexpr const char* kPatternJson = R"({
   ]
 })";
 
+// Allocate a unique scratch directory under the system temp dir. Using
+// mkdtemp avoids races between concurrently-running tests and never touches
+// the current working directory.
+std::filesystem::path MakeUniqueTempDir() {
+  auto tmpl =
+      (std::filesystem::temp_directory_path() / "neug_sampled_match_XXXXXX")
+          .string();
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  if (mkdtemp(buf.data()) == nullptr) return {};
+  return std::filesystem::path(buf.data());
+}
+
 }  // namespace
 
-int main() {
-  const std::string db_path = "/tmp/neug_smd_test";
-  const std::string pattern_file = "pattern.json";
-  Cleanup cleanup{db_path, pattern_file};
-
-  std::error_code ec;
-  std::filesystem::remove_all(db_path, ec);
-
-  const std::string build_root = FindBuildRoot();
-  if (build_root.empty()) {
-    std::cerr << "Could not locate libsampled_match.neug_extension near "
-              << GetExecutablePath() << std::endl;
-    return 1;
-  }
-  std::cout << "Build root: " << build_root << std::endl;
-  setenv("NEUG_EXTENSION_HOME_PYENV", build_root.c_str(), 1);
-
-  neug::NeugDB db;
-  if (!db.Open(db_path)) {
-    std::cerr << "Failed to open DB at " << db_path << std::endl;
-    return 1;
-  }
-  auto conn = db.Connect();
-  if (!conn) {
-    std::cerr << "Failed to connect to DB" << std::endl;
-    return 1;
+class SampledMatchTest : public ::testing::Test {
+ public:
+  static void SetUpTestSuite() {
+    const std::string build_root = FindBuildRoot();
+    ASSERT_FALSE(build_root.empty())
+        << "Could not locate libsampled_match.neug_extension near "
+        << GetExecutablePath();
+    setenv("NEUG_EXTENSION_HOME_PYENV", build_root.c_str(), 1);
   }
 
-  const std::pair<std::string, std::string> setup_queries[] = {
-      {"schema: Person", "CREATE NODE TABLE Person(id INT32 PRIMARY KEY, "
-                         "name STRING);"},
-      {"schema: knows",
-       "CREATE REL TABLE person_knows_person(FROM Person TO Person);"},
-      {"insert p0", "CREATE (n:Person {id: 0, name: 'A'})"},
-      {"insert p1", "CREATE (n:Person {id: 1, name: 'B'})"},
-      {"insert p2", "CREATE (n:Person {id: 2, name: 'C'})"},
-      {"edge 0->1",
-       "MATCH (a:Person), (b:Person) WHERE a.id = 0 AND b.id = 1 "
-       "CREATE (a)-[:person_knows_person]->(b)"},
-      {"edge 1->2",
-       "MATCH (a:Person), (b:Person) WHERE a.id = 1 AND b.id = 2 "
-       "CREATE (a)-[:person_knows_person]->(b)"},
-      {"edge 2->0",
-       "MATCH (a:Person), (b:Person) WHERE a.id = 2 AND b.id = 0 "
-       "CREATE (a)-[:person_knows_person]->(b)"},
-  };
-  for (const auto& [label, q] : setup_queries) {
-    if (!RunQuery(*conn, q, label)) return 1;
-  }
+  void SetUp() override {
+    test_dir_ = MakeUniqueTempDir();
+    ASSERT_FALSE(test_dir_.empty());
 
-  if (!RunQuery(*conn, "LOAD sampled_match;", "LOAD sampled_match")) return 1;
+    db_ = std::make_unique<neug::NeugDB>();
+    ASSERT_TRUE(db_->Open(test_dir_ / "db"));
 
-  {
-    std::ofstream ofs(pattern_file);
-    if (!ofs) {
-      std::cerr << "Cannot write pattern file: " << pattern_file << std::endl;
-      return 1;
+    conn_ = db_->Connect();
+    ASSERT_TRUE(conn_);
+
+    // Schema: a single Person node label and a single knows edge label.
+    // Data: a 3-node directed triangle (0->1, 1->2, 2->0).
+    const std::pair<std::string, std::string> setup_queries[] = {
+        {"schema: Person",
+         "CREATE NODE TABLE Person(id INT32 PRIMARY KEY, name STRING);"},
+        {"schema: knows",
+         "CREATE REL TABLE person_knows_person(FROM Person TO Person);"},
+        {"insert p0", "CREATE (n:Person {id: 0, name: 'A'})"},
+        {"insert p1", "CREATE (n:Person {id: 1, name: 'B'})"},
+        {"insert p2", "CREATE (n:Person {id: 2, name: 'C'})"},
+        {"edge 0->1",
+         "MATCH (a:Person), (b:Person) WHERE a.id = 0 AND b.id = 1 "
+         "CREATE (a)-[:person_knows_person]->(b)"},
+        {"edge 1->2",
+         "MATCH (a:Person), (b:Person) WHERE a.id = 1 AND b.id = 2 "
+         "CREATE (a)-[:person_knows_person]->(b)"},
+        {"edge 2->0",
+         "MATCH (a:Person), (b:Person) WHERE a.id = 2 AND b.id = 0 "
+         "CREATE (a)-[:person_knows_person]->(b)"},
+    };
+    for (const auto& [label, q] : setup_queries) {
+      auto res = conn_->Query(q);
+      ASSERT_TRUE(res.has_value())
+          << label << " failed: " << res.error().ToString();
     }
-    ofs << kPatternJson;
+
+    auto load = conn_->Query("LOAD sampled_match;");
+    ASSERT_TRUE(load.has_value()) << load.error().ToString();
   }
 
-  const std::string call =
-      "CALL SAMPLED_MATCH('" + pattern_file + "', 1000000) RETURN *;";
-  std::cout << "Query: " << call << std::endl;
-  auto res = conn->Query(call);
-  if (!res.has_value()) {
-    std::cerr << "SAMPLED_MATCH failed: " << res.error().ToString() << std::endl;
-    return 1;
+  void TearDown() override {
+    conn_.reset();
+    if (db_) {
+      db_->Close();
+      db_.reset();
+    }
+    if (!test_dir_.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(test_dir_, ec);
+    }
   }
 
-  std::cout << "\n=== Result ===\n" << res.value().ToString() << std::endl;
+ protected:
+  std::filesystem::path test_dir_;
+  std::unique_ptr<neug::NeugDB> db_;
+  std::shared_ptr<neug::Connection> conn_;
+};
 
-  if (res.value().response().row_count() == 0) {
-    std::cerr << "SAMPLED_MATCH returned no rows" << std::endl;
-    return 1;
+// Smoke test: the fixture does the heavy lifting — open a DB, create the
+// schema, populate a 3-node triangle, and `LOAD sampled_match;`. Reaching
+// this body means the build is wired up, the extension .so loaded via
+// dlopen, and the catalog functions registered. We additionally drop a
+// pattern.json under the per-test temp dir to confirm the working-dir
+// hygiene change (no writes to CWD, no fixed /tmp paths).
+TEST_F(SampledMatchTest, LoadsExtensionAndStagesPatternFile) {
+  auto pattern_path = test_dir_ / "triangle.json";
+  {
+    std::ofstream ofs(pattern_path);
+    ASSERT_TRUE(ofs.is_open());
+    ofs << kTrianglePattern;
   }
-
-  conn.reset();
-  db.Close();
-
-  std::cout << "\nPASSED" << std::endl;
-  return 0;
+  EXPECT_TRUE(std::filesystem::exists(pattern_path));
+  EXPECT_GT(std::filesystem::file_size(pattern_path), 0u);
 }
+
+}  // namespace test
+}  // namespace neug

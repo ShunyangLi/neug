@@ -15,6 +15,9 @@ From your build directory, compile tests with:
 ```sh
 mkdir build && cd build
 cmake .. -DBUILD_EXTENSIONS="sampled_match" -DBUILD_TEST=ON
-make -j8 sampled_match_test
-./extension/sampled_match/tests/sampled_match_test
+make -j8 sampled_match_extension_test
+ctest -R sampled_match_extension_test --output-on-failure
 ```
+
+Each `TEST_F` runs under a unique `mkdtemp` scratch directory, so the suite
+is safe to run in parallel (e.g. `ctest -j`).
