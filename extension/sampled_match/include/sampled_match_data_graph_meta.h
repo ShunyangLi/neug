@@ -142,24 +142,28 @@ public:
     inline std::vector<int> GetNeighbors(int global_id) const {
         std::vector<int> result;
         if (global_id < 0 || global_id >= num_vertex_) return result;
+        auto& scratch = GetDedupScratch();
+        scratch.EnsureSize(num_vertex_);
+        auto& seen = scratch.seen;
+        auto& reset_list = scratch.reset_list;
         for (const auto& edge : GetAllOutIncidentEdges(global_id)) {
             int dst_global = std::get<1>(edge);
-            if (!nbr_seen_[dst_global]) {
-                nbr_seen_[dst_global] = true;
-                nbr_seen_reset_.push_back(dst_global);
+            if (!seen[dst_global]) {
+                seen[dst_global] = true;
+                reset_list.push_back(dst_global);
                 result.push_back(dst_global);
             }
         }
         for (const auto& edge : GetAllInIncidentEdges(global_id)) {
             int src_global = std::get<0>(edge);
-            if (!nbr_seen_[src_global]) {
-                nbr_seen_[src_global] = true;
-                nbr_seen_reset_.push_back(src_global);
+            if (!seen[src_global]) {
+                seen[src_global] = true;
+                reset_list.push_back(src_global);
                 result.push_back(src_global);
             }
         }
-        for (int v : nbr_seen_reset_) nbr_seen_[v] = false;
-        nbr_seen_reset_.clear();
+        for (int v : reset_list) seen[v] = false;
+        reset_list.clear();
         return result;
     }
     inline int GetCoreNum(int global_id) const {
@@ -317,6 +321,10 @@ public:
         auto [src_label, src_vid] = ToLocalId(global_id);
         auto sit = out_schemas_by_src_.find(src_label);
         if (sit == out_schemas_by_src_.end()) return result;
+        auto& scratch = GetDedupScratch();
+        scratch.EnsureSize(num_vertex_);
+        auto& seen = scratch.seen;
+        auto& reset_list = scratch.reset_list;
         for (const auto& [d_label, e_label] : sit->second) {
             uint64_t vk = PackViewKey(src_label, d_label, e_label);
             auto vit = out_view_cache_.find(vk);
@@ -324,18 +332,18 @@ public:
             NbrList edges = vit->second.get_edges(src_vid);
             for (auto it = edges.begin(); it != edges.end(); ++it) {
                 int dst_global = FastToGlobalId(d_label, *it);
-                if (dst_global >= 0 && !nbr_seen_[dst_global]) {
-                    nbr_seen_[dst_global] = true;
-                    nbr_seen_reset_.push_back(dst_global);
+                if (dst_global >= 0 && !seen[dst_global]) {
+                    seen[dst_global] = true;
+                    reset_list.push_back(dst_global);
                     result.push_back(dst_global);
                 }
             }
         }
-        for (int v : nbr_seen_reset_) nbr_seen_[v] = false;
-        nbr_seen_reset_.clear();
+        for (int v : reset_list) seen[v] = false;
+        reset_list.clear();
         return result;
     }
-    
+
     // Get in-neighbors with flat boolean dedup
     inline std::vector<int> GetInNeighbors(int global_id) const {
         std::vector<int> result;
@@ -343,6 +351,10 @@ public:
         auto [dst_label, dst_vid] = ToLocalId(global_id);
         auto sit = in_schemas_by_dst_.find(dst_label);
         if (sit == in_schemas_by_dst_.end()) return result;
+        auto& scratch = GetDedupScratch();
+        scratch.EnsureSize(num_vertex_);
+        auto& seen = scratch.seen;
+        auto& reset_list = scratch.reset_list;
         for (const auto& [s_label, e_label] : sit->second) {
             uint64_t vk = PackViewKey(dst_label, s_label, e_label);
             auto vit = in_view_cache_.find(vk);
@@ -350,15 +362,15 @@ public:
             NbrList edges = vit->second.get_edges(dst_vid);
             for (auto it = edges.begin(); it != edges.end(); ++it) {
                 int src_global = FastToGlobalId(s_label, *it);
-                if (src_global >= 0 && !nbr_seen_[src_global]) {
-                    nbr_seen_[src_global] = true;
-                    nbr_seen_reset_.push_back(src_global);
+                if (src_global >= 0 && !seen[src_global]) {
+                    seen[src_global] = true;
+                    reset_list.push_back(src_global);
                     result.push_back(src_global);
                 }
             }
         }
-        for (int v : nbr_seen_reset_) nbr_seen_[v] = false;
-        nbr_seen_reset_.clear();
+        for (int v : reset_list) seen[v] = false;
+        reset_list.clear();
         return result;
     }
 
@@ -537,7 +549,23 @@ private:
     void ComputeCoreNum();
     void ComputeLabelStatistics();
     void BuildSchemaIndex();
-    void InitDedupArrays();
+
+    // Per-thread scratch for dedup in GetNeighbors / GetOutNeighbors /
+    // GetInNeighbors. The DataGraphMeta instance is shared across threads via
+    // GraphDataCache, so the dedup bitmap must NOT live on the object — it
+    // would race. Each thread reuses its own scratch across calls (and across
+    // DataGraphMeta instances of varying sizes); the bitmap only ever grows.
+    struct DedupScratch {
+        std::vector<bool> seen;
+        std::vector<int> reset_list;
+        inline void EnsureSize(int n) {
+            if (static_cast<int>(seen.size()) < n) seen.resize(n, false);
+        }
+    };
+    static inline DedupScratch& GetDedupScratch() {
+        thread_local DedupScratch scratch;
+        return scratch;
+    }
 
     static inline uint32_t PackLabelPair(label_t a, label_t b) {
         return (static_cast<uint32_t>(a) << 16) | static_cast<uint32_t>(b);
@@ -579,10 +607,6 @@ private:
     std::unordered_map<uint64_t, GenericView> in_view_cache_;
     std::unordered_map<label_t, std::vector<std::pair<label_t, label_t>>> out_schemas_by_src_;
     std::unordered_map<label_t, std::vector<std::pair<label_t, label_t>>> in_schemas_by_dst_;
-
-    // ========== Flat boolean dedup for GetOutNeighbors/GetInNeighbors ==========
-    mutable std::vector<bool> nbr_seen_;
-    mutable std::vector<int> nbr_seen_reset_;
 };
 
 }  // namespace function

@@ -70,8 +70,7 @@ void DataGraphMeta::Preprocess() {
     
     // Step 2: Build schema index and cache views
     BuildSchemaIndex();
-    InitDedupArrays();
-    
+
     // Step 3: Compute k-core decomposition
     ComputeCoreNum();
     
@@ -391,11 +390,6 @@ void DataGraphMeta::BuildSchemaIndex() {
               << " outgoing + " << in_view_cache_.size() << " incoming views";
 }
 
-void DataGraphMeta::InitDedupArrays() {
-    nbr_seen_.assign(num_vertex_, false);
-    nbr_seen_reset_.reserve(max_degree_ > 0 ? max_degree_ : 256);
-}
-
 // ============================================================================
 // Checkpoint serialization
 // ============================================================================
@@ -471,42 +465,73 @@ bool DataGraphMeta::LoadFromFile(const std::string& filepath) {
         return false;
     }
 
+    // Cap any single vector at 1B entries (~4GB for int32/double). A corrupted
+    // or malicious checkpoint can otherwise request unbounded allocations.
+    constexpr int32_t kMaxVecSize = 1 << 30;
+
+    auto bail = [&](const std::string& msg) {
+        LOG(ERROR) << "[DataGraphMeta] " << msg << " in: " << filepath;
+        return false;
+    };
+
     auto readInt = [&]() -> int32_t {
-        int32_t v;
+        int32_t v = 0;
         ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
         return v;
     };
     auto readDouble = [&]() -> double {
-        double v;
+        double v = 0;
         ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
         return v;
     };
-    auto readIntVec = [&](std::vector<int>& vec) {
+    // expected_size < 0 means "no consistency check" (variable-length per-label
+    // bucket); otherwise the on-disk size must match exactly.
+    auto readIntVec = [&](std::vector<int>& vec, int32_t expected_size,
+                          const char* tag) -> bool {
         int32_t sz = readInt();
+        if (ifs.fail()) return bail(std::string("Truncated size for ") + tag);
+        if (sz < 0 || sz > kMaxVecSize)
+            return bail(std::string("Invalid size ") + std::to_string(sz) +
+                        " for " + tag);
+        if (expected_size >= 0 && sz != expected_size)
+            return bail(std::string("Size mismatch for ") + tag + ": got " +
+                        std::to_string(sz) + ", expected " +
+                        std::to_string(expected_size));
         vec.resize(sz);
         if (sz > 0) {
-            ifs.read(reinterpret_cast<char*>(vec.data()), sz * sizeof(int));
+            ifs.read(reinterpret_cast<char*>(vec.data()),
+                     static_cast<std::streamsize>(sz) * sizeof(int));
         }
+        if (ifs.fail()) return bail(std::string("Truncated payload for ") + tag);
+        return true;
     };
-    auto readDoubleVec = [&](std::vector<double>& vec) {
+    auto readDoubleVec = [&](std::vector<double>& vec, int32_t expected_size,
+                             const char* tag) -> bool {
         int32_t sz = readInt();
+        if (ifs.fail()) return bail(std::string("Truncated size for ") + tag);
+        if (sz < 0 || sz > kMaxVecSize)
+            return bail(std::string("Invalid size ") + std::to_string(sz) +
+                        " for " + tag);
+        if (expected_size >= 0 && sz != expected_size)
+            return bail(std::string("Size mismatch for ") + tag + ": got " +
+                        std::to_string(sz) + ", expected " +
+                        std::to_string(expected_size));
         vec.resize(sz);
         if (sz > 0) {
-            ifs.read(reinterpret_cast<char*>(vec.data()), sz * sizeof(double));
+            ifs.read(reinterpret_cast<char*>(vec.data()),
+                     static_cast<std::streamsize>(sz) * sizeof(double));
         }
+        if (ifs.fail()) return bail(std::string("Truncated payload for ") + tag);
+        return true;
     };
 
     char magic[4];
     ifs.read(magic, 4);
-    if (std::string(magic, 4) != DGMC_MAGIC) {
-        LOG(ERROR) << "[DataGraphMeta] Invalid checkpoint magic in: " << filepath;
-        return false;
-    }
+    if (ifs.fail() || std::string(magic, 4) != DGMC_MAGIC)
+        return bail("Invalid checkpoint magic");
     int32_t version = readInt();
-    if (version != DGMC_VERSION) {
-        LOG(ERROR) << "[DataGraphMeta] Unsupported checkpoint version " << version;
-        return false;
-    }
+    if (ifs.fail() || version != DGMC_VERSION)
+        return bail("Unsupported checkpoint version " + std::to_string(version));
 
     num_vertex_ = readInt();
     num_edge_ = readInt();
@@ -517,37 +542,60 @@ bool DataGraphMeta::LoadFromFile(const std::string& filepath) {
     max_out_degree_ = readInt();
     degeneracy_ = readInt();
     label_statistics_.vertex_label_entropy = readDouble();
+    if (ifs.fail()) return bail("Truncated header");
+    if (num_vertex_ < 0 || num_vertex_ > kMaxVecSize ||
+        num_edge_ < 0 ||
+        num_labels_ < 0 || num_labels_ > kMaxVecSize ||
+        num_edge_labels_ < 0)
+        return bail("Invalid scalar counts in header");
 
     int32_t gtl_size = readInt();
+    if (ifs.fail()) return bail("Truncated global_to_local size");
+    if (gtl_size != num_vertex_)
+        return bail("global_to_local size " + std::to_string(gtl_size) +
+                    " != num_vertex_ " + std::to_string(num_vertex_));
     global_to_local_.resize(gtl_size);
     local_to_global_.clear();
     local_to_global_.reserve(gtl_size);
     for (int i = 0; i < gtl_size; i++) {
-        label_t label = static_cast<label_t>(readInt());
-        vid_t vid = static_cast<vid_t>(readInt());
+        int32_t raw_label = readInt();
+        int32_t raw_vid = readInt();
+        if (ifs.fail()) return bail("Truncated global_to_local entry");
+        if (raw_label < 0 || raw_label >= num_labels_)
+            return bail("Label " + std::to_string(raw_label) +
+                        " out of range in global_to_local");
+        label_t label = static_cast<label_t>(raw_label);
+        vid_t vid = static_cast<vid_t>(raw_vid);
         global_to_local_[i] = {label, vid};
         local_to_global_[{label, vid}] = i;
     }
 
-    readIntVec(vertex_label_);
+    if (!readIntVec(vertex_label_, num_vertex_, "vertex_label_")) return false;
 
     int32_t vbl_size = readInt();
+    if (ifs.fail()) return bail("Truncated vertices_by_label outer size");
+    if (vbl_size != num_labels_)
+        return bail("vertices_by_label outer size " + std::to_string(vbl_size) +
+                    " != num_labels_ " + std::to_string(num_labels_));
     vertices_by_label_.resize(vbl_size);
+    int64_t vbl_total = 0;
     for (int i = 0; i < vbl_size; i++) {
-        readIntVec(vertices_by_label_[i]);
+        if (!readIntVec(vertices_by_label_[i], -1, "vertices_by_label_[i]"))
+            return false;
+        vbl_total += static_cast<int64_t>(vertices_by_label_[i].size());
+        if (vbl_total > num_vertex_)
+            return bail("vertices_by_label total exceeds num_vertex_");
     }
 
-    readIntVec(in_degree_);
-    readIntVec(out_degree_);
-    readIntVec(degree_);
-    readIntVec(core_num_);
-    readIntVec(degeneracy_order_);
-    readDoubleVec(label_statistics_.vertex_label_probability);
-
-    if (ifs.fail()) {
-        LOG(ERROR) << "[DataGraphMeta] Error reading checkpoint file: " << filepath;
+    if (!readIntVec(in_degree_, num_vertex_, "in_degree_")) return false;
+    if (!readIntVec(out_degree_, num_vertex_, "out_degree_")) return false;
+    if (!readIntVec(degree_, num_vertex_, "degree_")) return false;
+    if (!readIntVec(core_num_, num_vertex_, "core_num_")) return false;
+    if (!readIntVec(degeneracy_order_, num_vertex_, "degeneracy_order_"))
         return false;
-    }
+    if (!readDoubleVec(label_statistics_.vertex_label_probability, num_labels_,
+                       "vertex_label_probability"))
+        return false;
 
     ifs.close();
 
@@ -572,7 +620,6 @@ bool DataGraphMeta::LoadFromFile(const std::string& filepath) {
     }
 
     BuildSchemaIndex();
-    InitDedupArrays();
 
     LOG(INFO) << "[DataGraphMeta] Loaded checkpoint from: " << filepath
               << " (" << num_vertex_ << " vertices, " << num_edge_ << " edges)";

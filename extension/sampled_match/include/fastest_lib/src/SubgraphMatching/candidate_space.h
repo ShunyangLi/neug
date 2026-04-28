@@ -49,7 +49,6 @@ using Value = neug::execution::Value;
 
 namespace GraphLib {
 namespace SubgraphMatching {
-    inline BipartiteMaximumMatching BPSolver;
     enum STRUCTURE_FILTER {
         NO_STRUCTURE_FILTER,
         TRIANGLE_SAFETY,
@@ -126,6 +125,14 @@ namespace SubgraphMatching {
         int GetNumCSVertex() {return num_candidate_vertex;};
         int GetNumCSEdge() {return num_candidate_edge;};
     private:
+        // Per-instance bipartite matcher: previously a single inline global,
+        // which (a) raced when concurrent queries each constructed their own
+        // CandidateSpace and (b) leaked because each ctor called Initialize()
+        // again, overwriting the previous run's buffers without freeing.
+        // Owning it here gives each query its own solver and lets ~CandidateSpace
+        // free the buffers via BipartiteMaximumMatching's destructor.
+        BipartiteMaximumMatching BPSolver;
+
         dict CSInfo;
         const neug::StorageReadInterface& graph_;
         DataGraphMeta& data_meta_;

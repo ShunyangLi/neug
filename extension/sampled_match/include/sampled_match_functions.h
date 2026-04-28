@@ -17,11 +17,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -188,14 +191,45 @@ inline std::vector<PropCons> ParseConstraints(const rapidjson::Value& constraint
 }
 
 // ============================================================================
-// Output file path helper: builds a unique path under /tmp/p/neug_sample.
+// Output file path helper: builds a collision-resistant path under
+// <temp_dir>/neug_sample. Returns "" if the directory can't be created — the
+// caller's existing ofstream check will trip on the empty path and log.
+// Filename = <prefix>_<ms>_<counter>_<rand-hex>.csv. Millisecond timestamp
+// alone collides under burst load; the per-process atomic counter and 64-bit
+// random suffix keep concurrent calls (across threads/processes) distinct.
 // ============================================================================
 inline std::string GenerateOutputFilePath(const std::string& prefix) {
   auto now = std::chrono::system_clock::now();
   auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
       now.time_since_epoch()).count();
-  std::filesystem::create_directories("/tmp/p/neug_sample");
-  return "/tmp/p/neug_sample/" + prefix + "_" + std::to_string(timestamp) + ".csv";
+
+  static std::atomic<uint64_t> counter{0};
+  uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+
+  // Each thread keeps its own RNG seeded from random_device + a high-res
+  // clock — random_device alone has been observed to repeat on some libcs
+  // when multiple threads construct one back-to-back.
+  thread_local std::mt19937_64 rng{
+      static_cast<uint64_t>(std::random_device{}()) ^
+      static_cast<uint64_t>(
+          std::chrono::high_resolution_clock::now().time_since_epoch().count())};
+  uint64_t rand_bits = rng();
+
+  std::ostringstream name;
+  name << prefix << "_" << timestamp << "_" << seq << "_"
+       << std::hex << std::setw(16) << std::setfill('0') << rand_bits
+       << ".csv";
+
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "neug_sample";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (ec) {
+    LOG(ERROR) << "[SAMPLED_MATCH] Failed to create output directory " << dir
+               << ": " << ec.message();
+    return "";
+  }
+  return (dir / name.str()).string();
 }
 
 // ============================================================================
@@ -474,112 +508,102 @@ class SampledSubgraphMatcher {
    * @return Estimated count of embeddings
    */
   double match() {
+    // All progress traces go through glog: VLOG(1) for per-step progress,
+    // VLOG(2) for per-vertex/per-edge dumps. Enable with `GLOG_v=1` (or 2)
+    // — by default `CALL SAMPLED_MATCH` produces no chatter on stdout.
     auto& cache = GraphDataCache::Instance();
     auto& cached_data = cache.GetOrCreate(&graph_);
 
     // Steps 0-1: reuse the cache when possible; initialize lazily otherwise.
     if (!cached_data.preprocessed) {
-      std::cout << "[match] Graph not initialized, calling DoGraphInitialization..." << std::endl;
+      VLOG(1) << "[SAMPLED_MATCH] Graph not initialized, running DoGraphInitialization...";
       DoGraphInitialization(graph_, true);
     } else {
-      std::cout << "[0-1] Using cached graph data..." << std::endl;
-      std::cout << "  Vertices: " << cached_data.data_meta->GetNumVertices() << std::endl;
-      std::cout << "  Edges: " << cached_data.data_meta->GetNumEdges() << std::endl;
+      VLOG(1) << "[SAMPLED_MATCH] Using cached graph data: "
+              << cached_data.data_meta->GetNumVertices() << " vertices, "
+              << cached_data.data_meta->GetNumEdges() << " edges";
     }
-    std::cout << std::endl;
 
     // Step 2: always reload the pattern — callers can vary it per invocation.
-    std::cout << "[2] Loading pattern graph from: " << pattern_file_ << std::endl;
+    VLOG(1) << "[SAMPLED_MATCH] Loading pattern graph from: " << pattern_file_;
     pattern_graph_ = CreatePatternFromJson(pattern_file_);
     if (!pattern_graph_ || pattern_graph_->GetNumVertices() == 0) {
-        std::cerr << "  ERROR: Failed to load pattern!" << std::endl;
-        return -1;
+      LOG(ERROR) << "[SAMPLED_MATCH] Failed to load pattern from: " << pattern_file_;
+      return -1;
     }
-    std::cout << "  Pattern: " << pattern_graph_->GetNumVertices() << " vertices, " 
-              << pattern_graph_->GetNumEdges() << " edges" << std::endl;
-    
-    // Print pattern details
-    std::cout << "  Pattern vertices:" << std::endl;
-    for (int i = 0; i < pattern_graph_->GetNumVertices(); i++) {
+    VLOG(1) << "[SAMPLED_MATCH] Pattern: " << pattern_graph_->GetNumVertices()
+            << " vertices, " << pattern_graph_->GetNumEdges() << " edges";
+
+    if (VLOG_IS_ON(2)) {
+      VLOG(2) << "[SAMPLED_MATCH] Pattern vertices:";
+      for (int i = 0; i < pattern_graph_->GetNumVertices(); i++) {
         int label = pattern_graph_->vertex_label[i];
-        std::cout << "    v" << i << ": label=" << label 
-                  << " (out_deg=" << pattern_graph_->GetOutDegree(i) 
-                  << ", in_deg=" << pattern_graph_->GetInDegree(i) << ")" << std::endl;
-    }
-    std::cout << "  Pattern edges:" << std::endl;
-    for (int i = 0; i < pattern_graph_->GetNumEdges(); i++) {
+        VLOG(2) << "  v" << i << ": label=" << label
+                << " (out_deg=" << pattern_graph_->GetOutDegree(i)
+                << ", in_deg=" << pattern_graph_->GetInDegree(i) << ")";
+      }
+      VLOG(2) << "[SAMPLED_MATCH] Pattern edges:";
+      for (int i = 0; i < pattern_graph_->GetNumEdges(); i++) {
         auto& [src, dst] = pattern_graph_->edge_list[i];
         int label = pattern_graph_->edge_label[i];
-        std::cout << "    e" << i << ": " << src << " -[label=" << label << "]-> " << dst << std::endl;
+        VLOG(2) << "  e" << i << ": " << src << " -[label=" << label << "]-> " << dst;
+      }
     }
-    std::cout << std::endl;
 
     // Step 3: Process pattern (compute core numbers, build incidence list, etc.)
-    std::cout << "[3] Processing pattern..." << std::endl;
+    VLOG(1) << "[SAMPLED_MATCH] Processing pattern...";
     pattern_graph_->ProcessPattern(*cached_data.data_meta, cached_data.schema_graph);
-    std::cout << "  Done." << std::endl;
-    std::cout << std::endl;
-    
+
     // Step 4: Setup cardinality estimation options
-    std::cout << "[4] Setting up cardinality estimation..." << std::endl;
     GraphLib::CardinalityEstimation::CardEstOption opt;
     opt.MAX_QUERY_VERTEX = std::max(12, pattern_graph_->GetNumVertices());
     opt.MAX_QUERY_EDGE = std::max(24, pattern_graph_->GetNumEdges());
     opt.structure_filter = GraphLib::SubgraphMatching::NO_STRUCTURE_FILTER;
-    std::cout << "  MAX_QUERY_VERTEX: " << opt.MAX_QUERY_VERTEX << std::endl;
-    std::cout << "  MAX_QUERY_EDGE: " << opt.MAX_QUERY_EDGE << std::endl;
-    std::cout << std::endl;
-    
+    VLOG(1) << "[SAMPLED_MATCH] CardEst options: MAX_QUERY_VERTEX="
+            << opt.MAX_QUERY_VERTEX << ", MAX_QUERY_EDGE=" << opt.MAX_QUERY_EDGE;
+
     // Step 5: Run cardinality estimation
-    std::cout << "[5] Running cardinality estimation..." << std::endl;
-    std::cout << "  Sample size: " << sample_size_ << std::endl;
-    
-    GraphLib::CardinalityEstimation::FaSTestCardinalityEstimation estimator(graph_, *cached_data.data_meta, opt);
+    VLOG(1) << "[SAMPLED_MATCH] Running cardinality estimation, sample size: "
+            << sample_size_;
+    GraphLib::CardinalityEstimation::FaSTestCardinalityEstimation estimator(
+        graph_, *cached_data.data_meta, opt);
     double est = estimator.EstimateEmbeddings(pattern_graph_.get(), sample_size_);
-    
-    std::cout << std::endl;
-    std::cout << "=== Results ===" << std::endl;
-    std::cout << "  Estimated embedding count: " << (long long)est << std::endl;
-    
-    // Get and store sampled results
+
     sampled_results_ = estimator.GetSampledResult();
     int num_samples = sampled_results_.size() / pattern_graph_->GetNumVertices();
-    std::cout << "  Number of sampled embeddings: " << num_samples << std::endl;
-    
-    // Print first few samples
-    if (num_samples > 0) {
-        std::cout << "  First 5 sampled embeddings:" << std::endl;
-        int show_count = std::min(5, num_samples);
-        for (int i = 0; i < show_count; i++) {
-            std::cout << "    [" << i << "]: ";
-            for (int j = 0; j < pattern_graph_->GetNumVertices(); j++) {
-                if (j > 0) std::cout << " -> ";
-                std::cout << sampled_results_[i * pattern_graph_->GetNumVertices() + j];
-            }
-            std::cout << std::endl;
+    VLOG(1) << "[SAMPLED_MATCH] Estimated embedding count: " << (long long)est
+            << ", sampled embeddings: " << num_samples;
+
+    if (VLOG_IS_ON(2) && num_samples > 0) {
+      VLOG(2) << "[SAMPLED_MATCH] First 5 sampled embeddings:";
+      int show_count = std::min(5, num_samples);
+      for (int i = 0; i < show_count; i++) {
+        std::ostringstream oss;
+        for (int j = 0; j < pattern_graph_->GetNumVertices(); j++) {
+          if (j > 0) oss << " -> ";
+          oss << sampled_results_[i * pattern_graph_->GetNumVertices() + j];
         }
+        VLOG(2) << "  [" << i << "]: " << oss.str();
+      }
     }
-    
-    // Print estimation info
-    auto result_info = estimator.GetResult();
-    std::cout << std::endl;
-    std::cout << "  Estimation details:" << std::endl;
-    for (const auto& [key, value] : result_info) {
-        std::cout << "    " << key << ": ";
+
+    if (VLOG_IS_ON(2)) {
+      auto result_info = estimator.GetResult();
+      VLOG(2) << "[SAMPLED_MATCH] Estimation details:";
+      for (const auto& [key, value] : result_info) {
+        std::ostringstream oss;
         if (value.type() == typeid(double)) {
-            std::cout << std::any_cast<double>(value);
+          oss << std::any_cast<double>(value);
         } else if (value.type() == typeid(int)) {
-            std::cout << std::any_cast<int>(value);
+          oss << std::any_cast<int>(value);
         } else if (value.type() == typeid(std::string)) {
-            std::cout << std::any_cast<std::string>(value);
+          oss << std::any_cast<std::string>(value);
         }
-        std::cout << std::endl;
+        VLOG(2) << "  " << key << ": " << oss.str();
+      }
     }
-    
+
     estimated_count_ = est;
-    std::cout << std::endl;
-    std::cout << "=== Matching completed ===" << std::endl;
-    
     return est;
   }
   
