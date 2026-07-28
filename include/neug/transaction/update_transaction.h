@@ -182,6 +182,10 @@ class StorageTPUpdateInterface : public StorageUpdateInterface {
 
   void CreateCheckpoint() override;
 
+  neug::result<StorageIndex*> CreateIndex(
+      std::unique_ptr<IndexMeta> meta) override;
+  Status DropIndex(const std::string& name) override;
+
  private:
   // Marks go to the COW clone; abort discards them with the clone.
   void MarkVertexTableDirty(label_t label) override {
@@ -212,7 +216,7 @@ class StorageTPUpdateInterface : public StorageUpdateInterface {
                         int32_t ie_offset) override;
 
   // --- Batch *Impl ---
-  Status BatchAddVerticesImpl(
+  result<std::vector<vid_t>> BatchAddVerticesImpl(
       label_t v_label_id,
       std::shared_ptr<IDataChunkSupplier> supplier) override;
   Status BatchAddEdgesImpl(
@@ -261,6 +265,7 @@ class StorageTPUpdateInterface : public StorageUpdateInterface {
   Status detachForResize(label_t src_label, label_t dst_label,
                          label_t edge_label, size_t capacity);
   Status prepareVertexDelete(label_t label, const std::vector<vid_t>& lids);
+  Status detachIndex(StorageIndex& index);
 
   std::shared_ptr<PropertyGraph>& cow_graph_;
   PropertyGraphCowState& cow_state_;

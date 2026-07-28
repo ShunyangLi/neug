@@ -26,6 +26,12 @@
 
 namespace neug {
 
+class StorageIndex;
+class StorageIndexManager;
+struct IndexMeta;
+struct IndexQueryParams;
+struct SearchResult;
+
 namespace graph_interface_impl {
 
 using neug::label_t;
@@ -349,6 +355,23 @@ class StorageReadInterface : virtual public IStorageInterface {
 
   const Schema& schema() const override { return view_.schema(); }
 
+  /**
+   * @brief Search an index selected by its unique name.
+   *
+   * This interface is intended for the execution layer's IndexScan operator.
+   * The IndexScan optimizer matches a query to the appropriate index and
+   * supplies its unique name; execution then invokes Search with the
+   * index-specific query parameters and receives the matching vertex set.
+   *
+   * @param unique_index_name Unique name of the index selected by the
+   * optimizer.
+   * @param params Index-specific search parameters.
+   * @return Vertex IDs matching the index query, or an error.
+   */
+  result<std::vector<SearchResult>> IndexSearch(
+      const std::string& unique_index_name,
+      const IndexQueryParams& params) const;
+
  protected:
   const GraphView& view_;
   timestamp_t read_ts_;
@@ -439,15 +462,15 @@ class StorageInsertInterface : virtual public IStorageInterface {
    *
    * @param v_label_id Vertex label for all records
    * @param supplier Record batch data source
-   * @return Status indicating success or failure
+   * @return Inserted vertex IDs, or an error
    */
-  Status BatchAddVertices(label_t v_label_id,
-                          std::shared_ptr<IDataChunkSupplier> supplier) {
-    auto st = BatchAddVerticesImpl(v_label_id, std::move(supplier));
-    if (st.ok()) {
+  result<std::vector<vid_t>> BatchAddVertices(
+      label_t v_label_id, std::shared_ptr<IDataChunkSupplier> supplier) {
+    auto vids = BatchAddVerticesImpl(v_label_id, std::move(supplier));
+    if (vids) {
       MarkVertexTableDirty(v_label_id);
     }
-    return st;
+    return vids;
   }
 
   /**
@@ -482,7 +505,7 @@ class StorageInsertInterface : virtual public IStorageInterface {
                              vid_t dst, label_t edge_label,
                              const std::vector<Value>& properties,
                              const void*& prop) = 0;
-  virtual Status BatchAddVerticesImpl(
+  virtual result<std::vector<vid_t>> BatchAddVerticesImpl(
       label_t v_label_id, std::shared_ptr<IDataChunkSupplier> supplier) = 0;
   virtual Status BatchAddEdgesImpl(
       label_t src_label, label_t dst_label, label_t edge_label,
@@ -841,6 +864,13 @@ class StorageUpdateInterface : public StorageReadInterface,
    */
   virtual void CreateCheckpoint() = 0;
 
+  /**
+   * @brief Create, bind, and populate an index.
+   */
+  virtual neug::result<StorageIndex*> CreateIndex(
+      std::unique_ptr<IndexMeta> meta) = 0;
+  virtual Status DropIndex(const std::string& name) = 0;
+
  private:
   virtual void MarkSchemaDirty() = 0;
 
@@ -906,10 +936,15 @@ class StorageAPUpdateInterface : public StorageUpdateInterface {
         graph_(graph),
         mut_view_(view),
         alloc_(alloc),
-        timestamp_(timestamp) {}
+        timestamp_(timestamp),
+        index_manager_(graph_.mutable_index_manager()) {}
   ~StorageAPUpdateInterface() {}
 
   void CreateCheckpoint() override;
+
+  neug::result<StorageIndex*> CreateIndex(
+      std::unique_ptr<IndexMeta> meta) override;
+  Status DropIndex(const std::string& name) override;
 
  private:
   void MarkVertexTableDirty(label_t label) override {
@@ -937,7 +972,7 @@ class StorageAPUpdateInterface : public StorageUpdateInterface {
                         int32_t ie_offset) override;
   Status DeleteEdgesImpl(label_t src_label, vid_t src, label_t dst_label,
                          vid_t dst, label_t edge_label) override;
-  Status BatchAddVerticesImpl(
+  result<std::vector<vid_t>> BatchAddVerticesImpl(
       label_t v_label_id,
       std::shared_ptr<IDataChunkSupplier> supplier) override;
   Status BatchAddEdgesImpl(
@@ -975,6 +1010,7 @@ class StorageAPUpdateInterface : public StorageUpdateInterface {
   GraphView& mut_view_;
   neug::Allocator& alloc_;
   timestamp_t timestamp_;
+  StorageIndexManager& index_manager_;
 };
 
 }  // namespace neug
