@@ -17,7 +17,6 @@
 #include <glog/logging.h>
 
 #include <cstdlib>
-#include <exception>
 #include <memory>
 #include <new>
 #include <string>
@@ -70,23 +69,16 @@ class TpExecutionSlotPool {
           logger(std::move(in_logger)),
           slot(snapshot_store, std::move(planner),
                std::move(global_query_cache), version_manager, *allocator,
-               config, slot_id) {
+               QueryExecutionStrategy::kTransactional, logger.get(), config,
+               slot_id) {
       CHECK(logger != nullptr);
       logger->open();
-      slot.bindWalWriterForTp(*logger);
-    }
-    ~Entry() {
-      if (logger) {
-        try {
-          logger->close();
-        } catch (const std::exception& e) {
-          LOG(WARNING) << "Failed to close slot WAL writer: " << e.what();
-        } catch (...) { LOG(WARNING) << "Failed to close slot WAL writer"; }
-      }
     }
 
     std::shared_ptr<Allocator> allocator;
     char _padding0[128 - sizeof(std::shared_ptr<Allocator>)];
+    // Declaration order is intentional: slot is destroyed before the WAL
+    // writer it references.
     std::unique_ptr<IWalWriter> logger;
     char _padding1[4096 - sizeof(std::unique_ptr<IWalWriter>) -
                    sizeof(std::shared_ptr<Allocator>) - sizeof(_padding0)];
@@ -127,7 +119,6 @@ class TpExecutionSlotPool {
     } catch (...) {
       while (constructed_entries > 0) {
         auto& entry = entries_[--constructed_entries];
-        entry.slot.unbindWalWriterForTp();
         entry.~Entry();
       }
       free(entries_);
@@ -149,7 +140,6 @@ class TpExecutionSlotPool {
            "TpExecutionSlotPool destruction";
     if (entries_ != nullptr) {
       for (size_t slot_id = 0; slot_id < slot_num_; ++slot_id) {
-        entries_[slot_id].slot.unbindWalWriterForTp();
         entries_[slot_id].~Entry();
       }
       free(entries_);
