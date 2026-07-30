@@ -51,9 +51,9 @@
 namespace neug {
 
 inline std::string allocator_prefix(const std::string& allocator_dir,
-                                    int thread_id) {
+                                    int slot_id) {
   return (std::filesystem::path(allocator_dir) /
-          ("allocator_" + std::to_string(thread_id) + "_"))
+          ("allocator_" + std::to_string(slot_id) + "_"))
       .string();
 }
 
