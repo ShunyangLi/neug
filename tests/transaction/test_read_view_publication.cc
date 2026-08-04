@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -27,15 +28,25 @@
 #include "neug/storages/graph/property_graph.h"
 #include "neug/storages/graph_snapshot_store.h"
 #include "neug/transaction/read_snapshot_lease.h"
+#include "neug/transaction/timestamp_lease.h"
+#include "neug/transaction/transaction_utils.h"
 #include "neug/transaction/version_manager.h"
 #include "unittest/utils.h"
 
 namespace neug {
 namespace {
 
+constexpr uint64_t kReplacementPlanningGeneration = 1;
+
+uint64_t ReadPlanningGeneration(GraphSnapshotStore& store) {
+  SnapshotGuard current(store);
+  return current.get().planning_generation();
+}
+
 result<uint32_t> PrepareAndPublishSnapshot(
-    GraphSnapshotStore& store, const std::shared_ptr<PropertyGraph>& snapshot) {
-  auto prepared_result = store.PrepareSnapshot(snapshot);
+    GraphSnapshotStore& store, const std::shared_ptr<PropertyGraph>& snapshot,
+    uint64_t planning_generation) {
+  auto prepared_result = store.PrepareSnapshot(snapshot, planning_generation);
   if (!prepared_result) {
     return tl::unexpected(prepared_result.error());
   }
@@ -158,7 +169,8 @@ class ReadViewPublicationTest : public ::testing::Test {
   uint32_t PublishReplacement(VersionManager& version_manager) {
     const uint32_t timestamp = version_manager.acquire_update_timestamp();
     auto replacement = MakeReplacement();
-    auto prepared_result = store_->PrepareSnapshot(replacement);
+    auto prepared_result =
+        store_->PrepareSnapshot(replacement, kReplacementPlanningGeneration);
     EXPECT_TRUE(prepared_result.has_value());
     auto prepared = std::move(prepared_result).value();
     version_manager.begin_update_commit(timestamp);
@@ -226,13 +238,83 @@ TEST_F(ReadViewPublicationTest,
   EXPECT_FALSE(lease.view().schema().is_vertex_label_valid("company"));
 }
 
+TEST_F(ReadViewPublicationTest,
+       InPlaceWriteScopePublishesPlanningGenerationOnCurrentSnapshot) {
+  VersionManager version_manager;
+  version_manager.init_ts({1, 0}, 2);
+
+  const auto initial_planning_generation = ReadPlanningGeneration(*store_);
+  uint32_t initial_snapshot_generation = 0;
+  {
+    SnapshotGuard current(*store_);
+    initial_snapshot_generation = current.get().snapshot_generation();
+  }
+
+  uint32_t committed_timestamp = 0;
+  {
+    InPlaceWriteScope write_scope(version_manager, *store_);
+    committed_timestamp = write_scope.Timestamp();
+    write_scope.MarkPlanningChanged();
+  }
+
+  {
+    SnapshotGuard current(*store_);
+    EXPECT_EQ(current.get().snapshot_generation(), initial_snapshot_generation);
+    EXPECT_EQ(current.get().planning_generation(),
+              initial_planning_generation + 1);
+  }
+
+  auto reader = ReadSnapshotLease::Acquire(version_manager, *store_);
+  EXPECT_EQ(reader.timestamp(), committed_timestamp);
+  EXPECT_EQ(reader.planning_generation(), initial_planning_generation + 1);
+}
+
+TEST_F(ReadViewPublicationTest,
+       InPlaceWriteScopeWithoutPlanningChangeKeepsGeneration) {
+  VersionManager version_manager;
+  version_manager.init_ts({1, 0}, 2);
+
+  const auto initial_planning_generation = ReadPlanningGeneration(*store_);
+  uint32_t committed_timestamp = 0;
+  {
+    InPlaceWriteScope write_scope(version_manager, *store_);
+    committed_timestamp = write_scope.Timestamp();
+  }
+
+  auto reader = ReadSnapshotLease::Acquire(version_manager, *store_);
+  EXPECT_EQ(reader.timestamp(), committed_timestamp);
+  EXPECT_EQ(reader.planning_generation(), initial_planning_generation);
+}
+
+TEST_F(ReadViewPublicationTest,
+       InPlaceWriteScopePublishesDuringStackUnwinding) {
+  VersionManager version_manager;
+  version_manager.init_ts({1, 0}, 2);
+
+  const auto initial_planning_generation = ReadPlanningGeneration(*store_);
+  uint32_t committed_timestamp = 0;
+  EXPECT_THROW(
+      [&]() {
+        InPlaceWriteScope write_scope(version_manager, *store_);
+        committed_timestamp = write_scope.Timestamp();
+        write_scope.MarkPlanningChanged();
+        throw std::runtime_error("in-place write failed after mutation");
+      }(),
+      std::runtime_error);
+
+  auto reader = ReadSnapshotLease::Acquire(version_manager, *store_);
+  EXPECT_EQ(reader.timestamp(), committed_timestamp);
+  EXPECT_EQ(reader.planning_generation(), initial_planning_generation + 1);
+}
+
 TEST_F(ReadViewPublicationTest, LeaseRetriesAfterBlockedOpenCycle) {
   ScriptedVersionManager version_manager({1, 0});
   auto replacement = MakeReplacement();
   bool publish_succeeded = false;
   version_manager.set_acquire_hook([&](int acquire_count) {
     if (acquire_count == 1) {
-      auto published = PrepareAndPublishSnapshot(*store_, replacement);
+      auto published = PrepareAndPublishSnapshot(
+          *store_, replacement, kReplacementPlanningGeneration);
       publish_succeeded = published.has_value();
       if (published) {
         version_manager.publish({2, published.value()});
@@ -262,7 +344,8 @@ TEST_F(ReadViewPublicationTest, LeaseRetryUsesConfiguredRuntimeWait) {
   constexpr int mismatch_count = kRuntimeWaitSpinIterations + 1;
   version_manager.set_acquire_hook([&](int acquire_count) {
     if (acquire_count <= mismatch_count) {
-      auto published = PrepareAndPublishSnapshot(*store_, replacement);
+      auto published = PrepareAndPublishSnapshot(
+          *store_, replacement, kReplacementPlanningGeneration);
       publish_succeeded &= published.has_value();
       if (published) {
         version_manager.publish(

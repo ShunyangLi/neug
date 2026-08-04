@@ -321,9 +321,9 @@ static Status deleteVertexIndexData(
 // =============================================================================
 
 UpdateTransaction::UpdateTransaction(std::shared_ptr<PropertyGraph> cow_graph,
+                                     uint64_t planning_generation,
                                      Allocator& alloc, IWalWriter& logger,
                                      GraphSnapshotStore& snapshot_store,
-                                     execution::LocalQueryCache& cache,
                                      UpdateTimestampLease timestamp_lease)
     : cow_graph_(std::move(cow_graph)),
       cow_state_(PropertyGraphCowState::FromSchema(cow_graph_->schema())),
@@ -331,8 +331,8 @@ UpdateTransaction::UpdateTransaction(std::shared_ptr<PropertyGraph> cow_graph,
       alloc_(alloc),
       logger_(logger),
       snapshot_store_(snapshot_store),
-      pipeline_cache_(cache),
       timestamp_lease_(std::move(timestamp_lease)),
+      planning_generation_(planning_generation),
       ckp_(cow_graph_->checkpoint_ptr()) {}
 
 UpdateTransaction::~UpdateTransaction() { Abort(); }
@@ -346,13 +346,25 @@ bool UpdateTransaction::Commit() {
     return true;
   }
 
-  auto prepared_result = snapshot_store_.PrepareSnapshot(cow_graph_);
+  const bool schema_changed = wal_builder_.schema_changed();
+  if (schema_changed &&
+      planning_generation_ == std::numeric_limits<uint64_t>::max()) {
+    LOG(ERROR) << "Planning generation space exhausted";
+    Abort();
+    return false;
+  }
+  const uint64_t committed_planning_generation =
+      planning_generation_ + (schema_changed ? 1 : 0);
+
+  auto prepared_result = snapshot_store_.PrepareSnapshot(
+      cow_graph_, committed_planning_generation);
   if (!prepared_result) {
     LOG(ERROR) << "Failed to prepare graph snapshot: "
                << prepared_result.error().ToString();
     Abort();
     return false;
   }
+
   auto prepared = std::move(prepared_result).value();
 
   wal_builder_.finalize(timestamp());
@@ -363,10 +375,6 @@ bool UpdateTransaction::Commit() {
   }
 
   timestamp_lease_.BeginCommit();
-
-  if (wal_builder_.schema_changed()) {
-    pipeline_cache_.clearGlobalCache();
-  }
 
   // Preparation completed before WAL append, so publication is a bounded,
   // no-fail current-slot switch. Finish publishes the matching read view

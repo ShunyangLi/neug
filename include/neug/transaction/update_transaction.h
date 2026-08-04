@@ -26,7 +26,6 @@
 
 #include "flat_hash_map/flat_hash_map.hpp"
 #include "neug/common/types/value.h"
-#include "neug/execution/execute/query_cache.h"
 #include "neug/storages/allocators.h"
 #include "neug/storages/csr/mutable_csr.h"
 #include "neug/storages/graph/graph_interface.h"
@@ -43,6 +42,7 @@
 
 namespace neug {
 
+class ExecutionSlot;
 class PropertyGraph;
 class IWalWriter;
 class IVersionManager;
@@ -79,19 +79,19 @@ class UpdateTransaction {
    * @brief Construct an UpdateTransaction with a COW PropertyGraph.
    *
    * @param cow_graph PropertyGraph COW clone
+   * @param planning_generation Planning generation of the cloned snapshot
    * @param alloc Reference to memory allocator
    * @param logger Reference to WAL writer
    * @param snapshot_store Reference to GraphSnapshotStore for commit
-   * @param cache Reference to query cache
    * @param timestamp_lease Owned update timestamp and admission lifecycle
    *
    * @note The caller is responsible for acquiring the timestamp lease before
    * creating the COW copy via Clone().
    * @since v0.1.0
    */
-  UpdateTransaction(std::shared_ptr<PropertyGraph> cow_graph, Allocator& alloc,
+  UpdateTransaction(std::shared_ptr<PropertyGraph> cow_graph,
+                    uint64_t planning_generation, Allocator& alloc,
                     IWalWriter& logger, GraphSnapshotStore& snapshot_store,
-                    execution::LocalQueryCache& cache,
                     UpdateTimestampLease timestamp_lease);
 
   /**
@@ -115,7 +115,9 @@ class UpdateTransaction {
 
   const GraphView& view() const { return view_; }
 
-  GraphStats statistic() const { return GraphStats(view_); }
+  GraphStats statistic() const {
+    return GraphStats(view_, planning_generation_);
+  }
 
   // --- Read-only accessors (not graph modifications) ---
   const Schema& schema() const { return cow_graph_->schema(); }
@@ -162,8 +164,8 @@ class UpdateTransaction {
   Allocator& alloc_;
   IWalWriter& logger_;
   GraphSnapshotStore& snapshot_store_;
-  execution::LocalQueryCache& pipeline_cache_;
   UpdateTimestampLease timestamp_lease_;
+  uint64_t planning_generation_;
 
   std::shared_ptr<Checkpoint> ckp_;
   WalBuilder wal_builder_;

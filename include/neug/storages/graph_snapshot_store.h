@@ -19,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "neug/storages/graph/graph_view.h"
@@ -26,6 +27,9 @@
 #include "neug/utils/result.h"
 
 namespace neug {
+
+class ExecutionSlot;
+class InPlaceWriteScope;
 
 /**
  * @brief Fixed-size slot pool for MVCC PropertyGraph snapshots.
@@ -37,8 +41,8 @@ namespace neug {
  * Transaction usage:
  * - Read/Insert: PinCurrentSnapshot() -> slot.view() -> UnpinSnapshot().
  *   InsertTransaction mutates the live slot in-place (timestamp-filtered).
- * - Update: CurrentSnapshot().Clone() -> mutate COW copy ->
- * PrepareSnapshot() -> PreparedSnapshot::Publish().
+ * - Update: CloneCurrentForUpdate() -> mutate COW copy -> PrepareSnapshot() ->
+ *   PreparedSnapshot::Publish().
  *
  * Concurrency:
  * - Lock-free PinCurrentSnapshot via optimistic pin + verify loop.
@@ -71,12 +75,17 @@ class GraphSnapshotStore {
     PropertyGraph* mutable_graph() { return storage_.get(); }
     /// Snapshot publication generation carried by this slot incarnation.
     uint32_t snapshot_generation() const { return snapshot_generation_; }
+    /// Plan-cache invalidation generation carried by this snapshot.
+    uint64_t planning_generation() const {
+      return planning_generation_.load(std::memory_order_acquire);
+    }
 
    private:
     friend class GraphSnapshotStore;
     std::shared_ptr<PropertyGraph> storage_;
     GraphView view_;
     uint32_t snapshot_generation_{0};
+    std::atomic<uint64_t> planning_generation_{0};
     std::atomic<int> reader_count_{0};
   };
 
@@ -128,15 +137,16 @@ class GraphSnapshotStore {
   /// Unpin a slot. Cleans up and recycles if last reader on a stale slot.
   void UnpinSnapshot(const SnapshotSlot& slot) noexcept;
 
-  /// Current PropertyGraph (for UpdateTransaction to Clone).
-  /// No lock — VersionManager guarantees exclusive update access
-  /// (admission_state_==kInsertsBlocked, all inserters drained).
+  /// Current PropertyGraph. The caller must keep the current slot stable
+  /// through writer admission while using the returned reference.
   const PropertyGraph& CurrentSnapshot() const;
 
-  /// Reserve a slot/generation and fully build a pending snapshot publication.
+  /// Reserve and build a pending snapshot tagged with @p planning_generation.
   /// Returns ERR_POOL_EXHAUSTED without touching @p new_pg on failure.
+  /// Readers retain this tag for the lifetime of their pinned slot.
   result<PreparedSnapshot> PrepareSnapshot(
-      const std::shared_ptr<PropertyGraph>& new_pg);
+      const std::shared_ptr<PropertyGraph>& new_pg,
+      uint64_t planning_generation);
 
   /// Pool capacity.
   int SlotCount() const { return slot_num_; }
@@ -148,7 +158,14 @@ class GraphSnapshotStore {
     return !free_list_.empty();
   }
 
+  /// Clone the pinned current graph and capture its planning generation for an
+  /// update transaction. The caller must hold update admission to exclude
+  /// concurrent in-place writers.
+  std::pair<std::shared_ptr<PropertyGraph>, uint64_t> CloneCurrentForUpdate();
+
  private:
+  friend class InPlaceWriteScope;
+
   int slot_num_;
   std::vector<SnapshotSlot> slots_;
   std::atomic<int> cur_slot_index_{0};
@@ -160,6 +177,8 @@ class GraphSnapshotStore {
   int getFreeSlot();
   void returnFreeSlot(int slot_index);
   uint32_t reserveSnapshotGeneration();
+  uint32_t publishInPlaceMutation(SnapshotSlot& mutated_slot,
+                                  bool planning_changed) noexcept;
   void publishPreparedSnapshot(int slot_index) noexcept;
   void unpinSnapshotByIndex(int slot_index) noexcept;
   void cleanupSlot(int slot_index);

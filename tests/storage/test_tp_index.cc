@@ -117,7 +117,6 @@ class TPIndexTest : public ::testing::Test {
     wal_writer_.records.clear();
     auto global_cache = std::make_shared<execution::GlobalQueryCache>(
         std::make_shared<StubPlanner>());
-    local_cache_ = std::make_unique<execution::LocalQueryCache>(global_cache);
   }
 
   void StartSnapshotStore() {
@@ -128,9 +127,10 @@ class TPIndexTest : public ::testing::Test {
 
   UpdateTransaction NewUpdateTransaction() {
     UpdateTimestampLease timestamp_lease(version_manager_);
-    auto cow_graph = snapshot_store_->CurrentSnapshot().Clone();
-    return UpdateTransaction(std::move(cow_graph), allocator_, wal_writer_,
-                             *snapshot_store_, *local_cache_,
+    auto [cow_graph, planning_generation] =
+        snapshot_store_->CloneCurrentForUpdate();
+    return UpdateTransaction(std::move(cow_graph), planning_generation,
+                             allocator_, wal_writer_, *snapshot_store_,
                              std::move(timestamp_lease));
   }
 
@@ -360,7 +360,6 @@ class TPIndexTest : public ::testing::Test {
   std::unique_ptr<GraphSnapshotStore> snapshot_store_;
   VersionManager version_manager_;
   CapturingWalWriter wal_writer_;
-  std::unique_ptr<execution::LocalQueryCache> local_cache_;
 };
 
 TEST_F(TPIndexTest, CreateIndexEmptyGraphAndDuplicateName) {

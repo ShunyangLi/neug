@@ -15,7 +15,9 @@
 #pragma once
 
 #include <cassert>
+#include <functional>
 #include <optional>
+#include <utility>
 
 #include "neug/common/types/container_types.h"
 #include "neug/common/types/value.h"
@@ -929,15 +931,18 @@ class StorageUpdateInterface : public StorageReadInterface,
 
 class StorageAPUpdateInterface : public StorageUpdateInterface {
  public:
-  explicit StorageAPUpdateInterface(PropertyGraph& graph, GraphView& view,
-                                    timestamp_t timestamp,
-                                    neug::Allocator& alloc)
+  using PlanningChangedCallback = std::function<void()>;
+
+  explicit StorageAPUpdateInterface(
+      PropertyGraph& graph, GraphView& view, timestamp_t timestamp,
+      neug::Allocator& alloc, PlanningChangedCallback on_planning_changed = {})
       : StorageUpdateInterface(view, timestamp),
         graph_(graph),
         mut_view_(view),
         alloc_(alloc),
         timestamp_(timestamp),
-        index_manager_(graph_.mutable_index_manager()) {}
+        index_manager_(graph_.mutable_index_manager()),
+        on_planning_changed_(std::move(on_planning_changed)) {}
   ~StorageAPUpdateInterface() {}
 
   void CreateCheckpoint() override;
@@ -953,7 +958,12 @@ class StorageAPUpdateInterface : public StorageUpdateInterface {
   void MarkEdgeTableDirty(label_t src, label_t dst, label_t edge) override {
     graph_.MarkEdgeTableDirty(src, dst, edge);
   }
-  void MarkSchemaDirty() override { graph_.MarkSchemaDirty(); }
+  void MarkSchemaDirty() override {
+    graph_.MarkSchemaDirty();
+    if (on_planning_changed_) {
+      on_planning_changed_();
+    }
+  }
 
   Status UpdateVertexPropertyImpl(label_t label, vid_t lid, int col_id,
                                   const Value& value) override;
@@ -1011,6 +1021,7 @@ class StorageAPUpdateInterface : public StorageUpdateInterface {
   neug::Allocator& alloc_;
   timestamp_t timestamp_;
   StorageIndexManager& index_manager_;
+  PlanningChangedCallback on_planning_changed_;
 };
 
 }  // namespace neug

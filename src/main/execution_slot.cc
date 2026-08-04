@@ -34,6 +34,7 @@
 #include "neug/storages/graph/property_graph.h"
 #include "neug/storages/graph/schema.h"
 #include "neug/transaction/timestamp_lease.h"
+#include "neug/transaction/transaction_utils.h"
 #include "neug/transaction/version_manager.h"
 #include "neug/transaction/wal/wal.h"
 #include "neug/utils/exception/exception.h"
@@ -80,9 +81,20 @@ void ExecutionSlotLease::reset() noexcept {
 
 namespace {
 
-bool invalidatesQueryCache(const physical::ExecutionFlag& flags) {
-  return flags.schema() || flags.create_temp_table() || flags.batch() ||
-         flags.insert() || flags.update();
+void markPlanningChangedIfNeeded(InPlaceWriteScope& write_scope,
+                                 const execution::CacheValue* prepared_query,
+                                 const Status& execution_status) {
+  if (prepared_query == nullptr) {
+    return;
+  }
+  if (!execution_status.ok() ||
+      prepared_query->explain_mode == physical::ExplainMode::EXPLAIN) {
+    return;
+  }
+  const auto& flags = prepared_query->flags;
+  if (flags.batch() || flags.update()) {
+    write_scope.MarkPlanningChanged();
+  }
 }
 
 Status executePreparedQuery(execution::CacheValue& prepared_query,
@@ -147,9 +159,10 @@ InsertTransaction ExecutionSlot::GetInsertTransaction() {
 
 UpdateTransaction ExecutionSlot::GetUpdateTransaction() {
   UpdateTimestampLease timestamp_lease(version_manager_);
-  auto cow_graph = snapshot_store_.CurrentSnapshot().Clone();
-  return UpdateTransaction(std::move(cow_graph), alloc_, *wal_writer_,
-                           snapshot_store_, pipeline_cache_,
+  auto [cow_graph, planning_generation] =
+      snapshot_store_.CloneCurrentForUpdate();
+  return UpdateTransaction(std::move(cow_graph), planning_generation, alloc_,
+                           *wal_writer_, snapshot_store_,
                            std::move(timestamp_lease));
 }
 
@@ -238,34 +251,31 @@ Status ExecutionSlot::executeCore(const std::string& query,
   const auto access_mode = requested_mode == AccessMode::kUnKnown
                                ? planner_->analyzeMode(query)
                                : requested_mode;
+  std::shared_ptr<execution::CacheValue> prepared_query;
 
-  auto execute_on_storage = [this, &query, access_mode, &parameters,
-                             num_threads, &response](const GraphStats& stats,
-                                                     auto& storage) -> Status {
+  auto execute_on_storage =
+      [this, &query, access_mode, &parameters, num_threads, &response,
+       &prepared_query](const GraphStats& stats, auto& storage) -> Status {
     auto prepared = prepareQuery(stats, query, num_threads);
     if (!prepared) {
       return prepared.error();
     }
-    auto cache_value = std::move(prepared).value();
-    auto status = validatePlan(access_mode, cache_value->flags);
+    prepared_query = std::move(prepared).value();
+    auto status = validatePlan(access_mode, prepared_query->flags);
     if (!status.ok()) {
       return status;
     }
 
     auto parsed_parameters =
-        execution::parseJsonParameters(cache_value->params_type, parameters);
+        execution::parseJsonParameters(prepared_query->params_type, parameters);
     if (!parsed_parameters) {
       return parsed_parameters.error();
     }
 
-    status = executePreparedQuery(*cache_value, parsed_parameters.value(),
+    status = executePreparedQuery(*prepared_query, parsed_parameters.value(),
                                   storage, response);
     if (!status.ok()) {
       return status;
-    }
-    if (execution_strategy_ == QueryExecutionStrategy::kDirect &&
-        invalidatesQueryCache(cache_value->flags)) {
-      pipeline_cache_.clearGlobalCache();
     }
     return Status::OK();
   };
@@ -277,18 +287,19 @@ Status ExecutionSlot::executeCore(const std::string& query,
           ReadSnapshotLease::Acquire(version_manager_, snapshot_store_);
       const auto& view = lease.view();
       StorageReadInterface storage(view, lease.timestamp());
-      status = execute_on_storage(GraphStats(view), storage);
+      status = execute_on_storage(GraphStats(view, lease.planning_generation()),
+                                  storage);
     } else if (access_mode == AccessMode::kInsert ||
                access_mode == AccessMode::kUpdate ||
                access_mode == AccessMode::kSchema) {
-      UpdateTimestampLease lease(version_manager_);
-      lease.MakeUpdateExclusive();
-      SnapshotGuard guard(snapshot_store_);
-      auto& slot = guard.get();
-      StorageAPUpdateInterface storage(*slot.mutable_graph(),
-                                       slot.mutable_view(), lease.Timestamp(),
-                                       alloc_);
-      status = execute_on_storage(GraphStats(slot.view()), storage);
+      InPlaceWriteScope write_scope(version_manager_, snapshot_store_);
+      auto& slot = write_scope.Snapshot();
+      StorageAPUpdateInterface storage(
+          *slot.mutable_graph(), slot.mutable_view(), write_scope.Timestamp(),
+          alloc_, [&write_scope]() { write_scope.MarkPlanningChanged(); });
+      status = execute_on_storage(
+          GraphStats(slot.view(), slot.planning_generation()), storage);
+      markPlanningChangedIfNeeded(write_scope, prepared_query.get(), status);
     } else {
       return Status(
           StatusCode::ERR_NOT_SUPPORTED,
@@ -381,17 +392,22 @@ void ExecutionSlot::ClearTemporarySchema() {
     }
   }
 
-  UpdateTimestampLease lease(version_manager_);
-  lease.MakeUpdateExclusive();
-  SnapshotGuard guard(snapshot_store_);
-  auto& slot = guard.get();
+  InPlaceWriteScope write_scope(version_manager_, snapshot_store_);
+  auto& slot = write_scope.Snapshot();
   auto* graph = slot.mutable_graph();
+  bool schema_changed = false;
 
   auto temporary_edges = graph->schema().get_temporary_edge_triplet_keys();
   for (auto key : temporary_edges) {
     auto [src, dst, edge] = graph->schema().parse_edge_label(key);
     try {
-      graph->DeleteEdgeType(src, dst, edge);
+      const auto status = graph->DeleteEdgeType(src, dst, edge);
+      if (status.ok()) {
+        schema_changed = true;
+        write_scope.MarkPlanningChanged();
+      } else {
+        LOG(WARNING) << "Failed to cleanup temp edge: " << status.ToString();
+      }
     } catch (const std::exception& e) {
       LOG(WARNING) << "Failed to cleanup temp edge: " << e.what();
     }
@@ -400,15 +416,20 @@ void ExecutionSlot::ClearTemporarySchema() {
   auto temporary_vertices = graph->schema().get_temporary_vertex_labels();
   for (auto label : temporary_vertices) {
     try {
-      graph->DeleteVertexType(label);
+      const auto status = graph->DeleteVertexType(label);
+      if (status.ok()) {
+        schema_changed = true;
+        write_scope.MarkPlanningChanged();
+      } else {
+        LOG(WARNING) << "Failed to cleanup temp vertex: " << status.ToString();
+      }
     } catch (const std::exception& e) {
       LOG(WARNING) << "Failed to cleanup temp vertex: " << e.what();
     }
   }
 
-  if (!temporary_edges.empty() || !temporary_vertices.empty()) {
+  if (schema_changed) {
     slot.mutable_view().Rebuild(*graph);
-    pipeline_cache_.clearGlobalCache();
   }
 }
 

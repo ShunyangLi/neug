@@ -34,6 +34,7 @@
 
 namespace neug {
 
+class ExecutionSlot;
 class PropertyGraph;
 class IWalWriter;
 class IVersionManager;
@@ -196,7 +197,10 @@ class InsertTransaction {
 
   const Schema& schema() const;
 
-  GraphStats statistic() const { return GraphStats(guard_.get().view()); }
+  GraphStats statistic() const {
+    const auto& slot = guard_.get();
+    return GraphStats(slot.view(), slot.planning_generation());
+  }
 
   bool GetVertexIndex(label_t label, const Value& oid, vid_t& lid) const;
 
