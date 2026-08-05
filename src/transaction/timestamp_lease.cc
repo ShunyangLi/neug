@@ -59,6 +59,14 @@ void UpdateTimestampLease::Finish(
   commit_started_ = false;
 }
 
+void UpdateTimestampLease::FinishAndResetTimeline() noexcept {
+  CHECK_NE(timestamp_, kInactiveTimestamp);
+  CHECK(commit_started_);
+  version_manager_->finish_update_and_reset_timeline(timestamp_);
+  timestamp_ = kInactiveTimestamp;
+  commit_started_ = false;
+}
+
 void UpdateTimestampLease::reset() noexcept {
   if (timestamp_ == kInactiveTimestamp) {
     return;

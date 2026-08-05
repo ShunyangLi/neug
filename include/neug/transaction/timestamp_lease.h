@@ -43,6 +43,10 @@ class UpdateTimestampLease {
   void BeginCommit();
   void MakeUpdateExclusive();
   void Finish(std::optional<uint32_t> installed_snapshot_generation) noexcept;
+  /// Finish after storage and WAL have moved to a new timeline. The installed
+  /// snapshot generation is preserved while transaction visibility timestamps
+  /// restart from zero.
+  void FinishAndResetTimeline() noexcept;
 
  private:
   void reset() noexcept;

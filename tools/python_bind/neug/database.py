@@ -94,7 +94,7 @@ class Database(object):
             Note that in memory mode, the database will not be persisted to disk, and all data will be
             lost when the program exits. In this case, the db_path should not contain any illegal characters.
         mode : str
-            Mode to open the database, could be 'r', 'read', 'readwrite', 'w', 'rw', 'write'. Default is 'r' for read-only.
+            Mode to open the database, could be 'r', 'read', 'readwrite', 'w', 'rw', 'write'. Default is 'readwrite'.
         max_thread_num : int
             Maximum database thread count. Default is 0, which means
             auto-select from hardware concurrency and fall back to 1 if the
@@ -392,7 +392,12 @@ class Database(object):
 
     def close(self, log=True):
         """
-        Close the database connection.
+        Close the database and all of its connections.
+
+        For a read-write database with ``checkpoint_on_close=True``, this method
+        creates a checkpoint before releasing database resources.
+        The method is idempotent.
+        Automatic checkpoint creation is best effort: failures are logged and do not propagate to the caller.
         """
         db_path = getattr(self, "_db_path", None)
         if log and db_path and db_path.strip() != "":

@@ -18,6 +18,8 @@
 #include <glog/logging.h>
 #include <limits>
 #include <mutex>
+#include <ostream>
+#include <thread>
 
 #include "neug/utils/exception/exception.h"
 #include "neug/utils/likely.h"
@@ -327,6 +329,28 @@ void VersionManager::finish_update_timestamp(
       return;
     }
   }
+}
+
+void VersionManager::finish_update_and_reset_timeline(uint32_t ts) noexcept {
+  const uint64_t gate = operation_gate_state_.load(std::memory_order_acquire);
+  CHECK(OperationGateWord::phase(gate) == AdmissionState::kAllBlocked);
+  CHECK_EQ(OperationGateWord::inserters(gate), 0U);
+  CHECK_EQ(write_ts_.load(std::memory_order_acquire), ts + 1);
+
+  write_ts_.store(1, std::memory_order_relaxed);
+  read_ts_.store(0, std::memory_order_relaxed);
+  ts_window_.init();
+  published_read_view_.store(
+      PackPublishedReadView(
+          {0, installed_snapshot_generation_.load(std::memory_order_relaxed)}),
+      std::memory_order_release);
+
+  // A reader delayed between its phase load and speculative fetch_add may
+  // still touch the reader count after drain_readers() returned. Preserve the
+  // packed counters while reopening admission so that its rollback cannot be
+  // lost. The release side of the CAS publishes the reset timeline first.
+  transition_admission_phase(AdmissionState::kAllBlocked,
+                             AdmissionState::kOpen);
 }
 
 uint32_t VersionManager::acquire_compact_timestamp() {
