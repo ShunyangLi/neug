@@ -25,6 +25,10 @@ extern "C" {
 // extension metadata so SQL callers can invoke them.
 void Init() {
   try {
+    // The extension library stays loaded across database lifetimes. Drop
+    // cached graph views before registering it for the current database.
+    neug::pattern_matching::GraphDataCache::instance().clear_all();
+
     // Graph cache bootstrap: loads / prepares the in-memory data graph.
     neug::extension::ExtensionAPI::registerFunction<
         neug::pattern_matching::InitializeGraphFunction>(
