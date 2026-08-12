@@ -18,9 +18,28 @@
 
 #include <memory>
 #include <mutex>
-#include <utility>
 
 #include "pattern_matching_functions.h"
+
+namespace {
+
+std::weak_ptr<neug::pattern_matching::GraphDataCache> registration_cache;
+
+template <typename T>
+struct WithGraphCache {
+  static constexpr const char* name = T::name;
+
+  static neug::function::function_set getFunctionSet() {
+    auto cache = registration_cache.lock();
+    if (!cache) {
+      THROW_EXCEPTION_WITH_FILE_LINE(
+          "Pattern matching registration cache is unavailable");
+    }
+    return T::getFunctionSet(cache);
+  }
+};
+
+}  // namespace
 
 extern "C" {
 
@@ -30,61 +49,40 @@ extern "C" {
 void Init() {
   try {
     // The extension DSO is process-wide, but registration and cache ownership
-    // are catalog-local. Serialize concurrent LOADs, then use the final
-    // function as the completion marker so repeated LOADs preserve the warm
-    // cache while a new database catalog still receives a fresh one.
+    // are catalog-local. Serialize concurrent LOADs so every registered
+    // function for a catalog captures the same cache.
     static std::mutex init_mutex;
     std::lock_guard<std::mutex> lock(init_mutex);
-    auto* catalog = neug::main::MetadataRegistry::getCatalog();
-    if (catalog->containsFunction(
-            &neug::transaction::DUMMY_TRANSACTION,
-            neug::pattern_matching::SaveSampledmatchCheckpointFunction::name,
-            false)) {
-      return;
-    }
-
     auto cache = std::make_shared<neug::pattern_matching::GraphDataCache>();
-    auto register_function =
-        [catalog](const char* name, neug::function::function_set function_set) {
-          if (catalog->containsFunction(&neug::transaction::DUMMY_TRANSACTION,
-                                        name, false)) {
-            return;
-          }
-          catalog->addFunctionWithSignature(
-              &neug::transaction::DUMMY_TRANSACTION,
-              neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY, name,
-              std::move(function_set), false);
-        };
+    registration_cache = cache;
 
     // Graph cache bootstrap: loads / prepares the in-memory data graph.
-    register_function(
-        neug::pattern_matching::InitializeGraphFunction::name,
-        neug::pattern_matching::InitializeGraphFunction::getFunctionSet(cache));
+    neug::extension::ExtensionAPI::registerFunction<
+        WithGraphCache<neug::pattern_matching::InitializeGraphFunction>>(
+        neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY);
 
     // Unified subgraph matching entry: PATTERN_MATCH(cypher) runs exact
     // matching over all matches; PATTERN_MATCH(cypher, size, is_sampled)
     // runs sampled matching (FaSTest, is_sampled=true) or exact matching with
     // early termination after `size` matches (is_sampled=false).
-    register_function(
-        neug::pattern_matching::PatternMatchFunction::name,
-        neug::pattern_matching::PatternMatchFunction::getFunctionSet(cache));
+    neug::extension::ExtensionAPI::registerFunction<
+        WithGraphCache<neug::pattern_matching::PatternMatchFunction>>(
+        neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY);
 
     // Vertex property lookup for matched vertices.
-    register_function(
-        neug::pattern_matching::GetVertexPropertyFunction::name,
-        neug::pattern_matching::GetVertexPropertyFunction::getFunctionSet(
-            cache));
+    neug::extension::ExtensionAPI::registerFunction<
+        WithGraphCache<neug::pattern_matching::GetVertexPropertyFunction>>(
+        neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY);
 
     // Edge property lookup for matched edges.
-    register_function(
-        neug::pattern_matching::GetEdgePropertyFunction::name,
-        neug::pattern_matching::GetEdgePropertyFunction::getFunctionSet(cache));
+    neug::extension::ExtensionAPI::registerFunction<
+        WithGraphCache<neug::pattern_matching::GetEdgePropertyFunction>>(
+        neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY);
 
     // Persists the prepared graph cache to disk for faster restarts.
-    register_function(
-        neug::pattern_matching::SaveSampledmatchCheckpointFunction::name,
-        neug::pattern_matching::SaveSampledmatchCheckpointFunction::
-            getFunctionSet(cache));
+    neug::extension::ExtensionAPI::registerFunction<WithGraphCache<
+        neug::pattern_matching::SaveSampledmatchCheckpointFunction>>(
+        neug::catalog::CatalogEntryType::TABLE_FUNCTION_ENTRY);
 
     neug::extension::ExtensionAPI::registerExtension(
         neug::extension::ExtensionInfo{
